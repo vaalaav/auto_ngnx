@@ -275,13 +275,25 @@ install_amnezia_panel() {
         PANEL_DATA_DIR="/opt/amnezia-panel"
         mkdir -p "${PANEL_DATA_DIR}"
 
+        # ── Определить последнюю версию образа ──
+        log_info "Определяю последнюю версию образа с Docker Hub..."
+        PANEL_TAG=$(curl -fsSL \
+            "https://hub.docker.com/v2/repositories/prvtpro/amnezia-panel/tags?page_size=10" \
+            | grep -oP '"name":"\K[^"]+' | grep -E '^[0-9]' | head -1)
+        if [[ -z "$PANEL_TAG" ]]; then
+            log_warn "Не удалось определить версию — использую 'latest'."
+            PANEL_TAG="latest"
+        else
+            log_ok "Найдена версия: ${PANEL_TAG}"
+        fi
+
         # ── docker-compose.yml ──
         cat > "${PANEL_DATA_DIR}/docker-compose.yml" <<EOF
 version: "3.8"
 
 services:
   amnezia-panel:
-    image: prvtpro/amnezia-panel:latest
+    image: prvtpro/amnezia-panel:${PANEL_TAG}
     container_name: amnezia-panel
     restart: unless-stopped
     ports:
@@ -314,6 +326,7 @@ server {
     listen [::]:80;
     server_name ${PANEL_DOMAIN};
 
+    # Certbot добавит HTTPS-блок автоматически
     location / {
         proxy_pass         http://127.0.0.1:${PANEL_PORT};
         proxy_http_version 1.1;
@@ -324,6 +337,8 @@ server {
         proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto \$scheme;
         proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
         client_max_body_size 50M;
     }
 }
@@ -332,9 +347,15 @@ EOF
                        "/etc/nginx/sites-enabled/${PANEL_DOMAIN}"
                 nginx -t && systemctl reload nginx
 
-                # SSL для поддомена
-                if ${SSL_INSTALLED:-false} && [[ -n "${LE_EMAIL:-}" ]]; then
+                # SSL для поддомена — обязательный шаг для HTTPS
+                if [[ -n "${LE_EMAIL:-}" ]]; then
+                    log_info "Выпускаю SSL для ${PANEL_DOMAIN} (HTTPS обязателен для панели)..."
+                    certbot --nginx -d "${PANEL_DOMAIN}" \
+                        --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect
+                    log_ok "SSL для ${PANEL_DOMAIN} выпущен — панель доступна по HTTPS."
+                else
                     if ask_yes_no "Выпустить SSL для ${PANEL_DOMAIN}?"; then
+                        read -r -p "$(echo -e "${CYAN}Email для Let\'s Encrypt: ${RESET}")" LE_EMAIL
                         certbot --nginx -d "${PANEL_DOMAIN}" \
                             --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect
                         log_ok "SSL для ${PANEL_DOMAIN} выпущен."
@@ -350,7 +371,11 @@ EOF
         fi
 
         log_ok "Amnezia Web Panel запущена."
-        echo -e "${YELLOW}  ▶  URL панели: http://127.0.0.1:${PANEL_PORT}${RESET}"
+        if [[ -n "${PANEL_DOMAIN:-}" ]]; then
+            echo -e "${YELLOW}  ▶  URL панели: https://${PANEL_DOMAIN}${RESET}"
+        else
+            echo -e "${YELLOW}  ▶  URL панели: http://127.0.0.1:${PANEL_PORT} (только локально)${RESET}"
+        fi
         echo -e "${YELLOW}  ▶  Логин: admin  |  Пароль: admin${RESET}"
         echo -e "${RED}  ⚠  НЕМЕДЛЕННО смените пароль после первого входа!${RESET}"
         AMNEZIA_INSTALLED=true
@@ -369,70 +394,48 @@ install_crowdsec() {
     echo
 
     if ask_yes_no "Установить и настроить CrowdSec?"; then
-        log_info "Добавляю репозиторий CrowdSec..."
-        curl -s https://install.crowdsec.net | bash
 
-        apt-get install -y crowdsec
-
-        # ── Парсеры ──
-        log_info "Устанавливаю парсеры и сценарии..."
-        cscli hub update
-
-        # SSH — всегда
-        cscli collections install crowdsecurity/linux
-        cscli collections install crowdsecurity/sshd
-
-        if $NGINX_INSTALLED; then
-            cscli collections install crowdsecurity/nginx
-            log_ok "CrowdSec: парсер Nginx подключён."
+        # ── Попытка 1: apt через официальный репозиторий ──
+        CS_INSTALLED_NATIVE=false
+        log_info "Попытка установки CrowdSec через apt..."
+        if curl -s --max-time 15 https://install.crowdsec.net | bash &&            apt-get install -y --no-install-recommends crowdsec crowdsec-firewall-bouncer-nftables 2>/dev/null; then
+            CS_INSTALLED_NATIVE=true
+            log_ok "CrowdSec установлен через apt."
+        else
+            log_warn "Apt-установка не удалась (возможно, CDN заблокирован). Переключаюсь на Docker..."
         fi
 
-        if ${AMNEZIA_INSTALLED:-false}; then
-            # Docker-логи
-            cscli collections install crowdsecurity/docker-logs 2>/dev/null || true
-            log_ok "CrowdSec: парсер Docker-logs подключён."
-        fi
+        if $CS_INSTALLED_NATIVE; then
+            # ── Нативная установка: парсеры ──
+            cscli hub update
+            cscli collections install crowdsecurity/linux crowdsecurity/sshd
+            $NGINX_INSTALLED && cscli collections install crowdsecurity/nginx
+            ${AMNEZIA_INSTALLED:-false} && cscli collections install crowdsecurity/docker-logs 2>/dev/null || true
 
-        # ── Bouncer для NFTables ──
-        log_info "Устанавливаю NFTables-bouncer..."
-        apt-get install -y crowdsec-firewall-bouncer-nftables
-
-        systemctl enable crowdsec-firewall-bouncer
-        systemctl start  crowdsec-firewall-bouncer
-
-        # ── Настройка acquis.yaml ──
-        ACQUIS_FILE="/etc/crowdsec/acquis.yaml"
-
-        # SSH
-        if ! grep -q "/var/log/auth.log" "${ACQUIS_FILE}" 2>/dev/null; then
-            cat >> "${ACQUIS_FILE}" <<'ACQUIS'
+            # ── Настройка acquis.yaml ──
+            ACQUIS_FILE="/etc/crowdsec/acquis.yaml"
+            grep -q "/var/log/auth.log" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
 
 ---
 filenames:
   - /var/log/auth.log
 labels:
   type: syslog
-ACQUIS
-        fi
+ACQ
 
-        # Nginx
-        if $NGINX_INSTALLED; then
-            if ! grep -q "/var/log/nginx" "${ACQUIS_FILE}" 2>/dev/null; then
-                cat >> "${ACQUIS_FILE}" <<'ACQUIS'
+            if $NGINX_INSTALLED; then
+                grep -q "/var/log/nginx" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
 
 ---
 filenames:
   - /var/log/nginx/*.log
 labels:
   type: nginx
-ACQUIS
+ACQ
             fi
-        fi
 
-        # Docker-логи Amnezia
-        if ${AMNEZIA_INSTALLED:-false}; then
-            if ! grep -q "amnezia-panel" "${ACQUIS_FILE}" 2>/dev/null; then
-                cat >> "${ACQUIS_FILE}" <<'ACQUIS'
+            if ${AMNEZIA_INSTALLED:-false}; then
+                grep -q "amnezia-panel" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
 
 ---
 source: docker
@@ -440,23 +443,85 @@ container_name:
   - amnezia-panel
 labels:
   type: nginx
-ACQUIS
+ACQ
             fi
+
+            systemctl enable crowdsec crowdsec-firewall-bouncer
+            systemctl restart crowdsec crowdsec-firewall-bouncer
+            log_ok "CrowdSec (нативный) запущен."
+            cscli collections list
+
+        else
+            # ── Установка через Docker (fallback при недоступном CDN) ──
+            log_info "Устанавливаю CrowdSec в Docker..."
+
+            # Собрать список коллекций
+            CS_COLLECTIONS="crowdsecurity/linux crowdsecurity/sshd"
+            $NGINX_INSTALLED && CS_COLLECTIONS="${CS_COLLECTIONS} crowdsecurity/nginx"
+
+            mkdir -p /opt/crowdsec/data /opt/crowdsec/config /opt/crowdsec/acquis.d
+
+            # acquis.yaml для Docker-контейнера
+            ACQUIS_FILE="/opt/crowdsec/config/acquis.yaml"
+            cat > "${ACQUIS_FILE}" <<EOF
+---
+filenames:
+  - /var/log/auth.log
+labels:
+  type: syslog
+EOF
+            if $NGINX_INSTALLED; then
+                cat >> "${ACQUIS_FILE}" <<EOF
+
+---
+filenames:
+  - /var/log/nginx/*.log
+labels:
+  type: nginx
+EOF
+            fi
+            if ${AMNEZIA_INSTALLED:-false}; then
+                cat >> "${ACQUIS_FILE}" <<EOF
+
+---
+source: docker
+container_name:
+  - amnezia-panel
+labels:
+  type: nginx
+EOF
+            fi
+
+            # Запустить CrowdSec
+            docker run -d                 --name crowdsec                 --restart unless-stopped                 --network host                 -e COLLECTIONS="${CS_COLLECTIONS}"                 -v /var/log:/var/log:ro                 -v /var/run/docker.sock:/var/run/docker.sock:ro                 -v /opt/crowdsec/data:/var/lib/crowdsec/data                 -v /opt/crowdsec/config:/etc/crowdsec                 crowdsecurity/crowdsec:latest
+
+            log_info "Ожидаю запуска CrowdSec (15 сек)..."
+            sleep 15
+
+            # Получить API-ключ и запустить bouncer
+            CS_API_KEY=$(docker exec crowdsec cscli bouncers add nftables-bouncer -o raw 2>/dev/null || echo "")
+            if [[ -n "$CS_API_KEY" ]]; then
+                docker run -d                     --name crowdsec-bouncer                     --restart unless-stopped                     --network host                     --privileged                     -e CROWDSEC_LAPI_URL=http://127.0.0.1:8080                     -e CROWDSEC_LAPI_KEY="${CS_API_KEY}"                     crowdsecurity/cs-firewall-bouncer:latest
+                log_ok "CrowdSec Bouncer запущен."
+            else
+                log_warn "Не удалось получить API-ключ для bouncer — добавьте вручную: docker exec crowdsec cscli bouncers add mybouncer"
+            fi
+
+            log_ok "CrowdSec (Docker) установлен."
+            docker exec crowdsec cscli collections list 2>/dev/null || true
         fi
 
-        systemctl enable crowdsec
-        systemctl restart crowdsec
-
-        # ── Итоговая сводка ──
-        log_ok "CrowdSec установлен."
         echo
-        cscli collections list
-        echo
-        echo -e "${CYAN}  Полезные команды:${RESET}"
-        echo "    cscli decisions list          — активные блокировки"
-        echo "    cscli alerts list             — история тревог"
-        echo "    cscli metrics                 — статистика"
-        echo "    cscli ban add ip <IP> 24h     — ручная блокировка"
+        echo -e "${CYAN}  Полезные команды CrowdSec:${RESET}"
+        if $CS_INSTALLED_NATIVE; then
+            echo "    cscli decisions list    — активные блокировки"
+            echo "    cscli alerts list       — история тревог"
+            echo "    cscli metrics           — статистика"
+        else
+            echo "    docker exec crowdsec cscli decisions list"
+            echo "    docker exec crowdsec cscli alerts list"
+            echo "    docker exec crowdsec cscli metrics"
+        fi
     else
         log_warn "CrowdSec пропущен."
         ask_continue_or_exit
