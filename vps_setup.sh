@@ -5,7 +5,8 @@
 #              CrowdSec · BBR
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# Не используем -e: обрабатываем ошибки вручную в каждой функции
 
 # ─── Цвета ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -175,7 +176,7 @@ server {
 EOF
 
         ln -sf "/etc/nginx/sites-available/${DOMAIN}" "/etc/nginx/sites-enabled/${DOMAIN}"
-        nginx -t && systemctl reload nginx
+        nginx -t && systemctl reload nginx || log_warn 'Nginx: ошибка конфига, reload пропущен'
         log_ok "Сайт ${DOMAIN} развёрнут из ${REPO_URL}."
     else
         log_warn "Установка сайта пропущена."
@@ -209,9 +210,14 @@ install_ssl() {
         done
 
         log_info "Выпускаю сертификат для ${DOMAIN} и www.${DOMAIN}..."
-        certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" \
+        if certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" \
             --non-interactive --agree-tos -m "${LE_EMAIL}" \
-            --redirect
+            --redirect; then
+            log_ok "Certbot успешно выпустил сертификат."
+        else
+            log_warn "Certbot завершился с ошибкой (см. /var/log/letsencrypt/letsencrypt.log)."
+            log_warn "Установка продолжается — SSL можно выпустить позже вручную."
+        fi
 
         # Таймер автопродления уже включён snap-пакетом,
         # но добавим cron как запасной вариант
@@ -345,7 +351,7 @@ server {
 EOF
                 ln -sf "/etc/nginx/sites-available/${PANEL_DOMAIN}" \
                        "/etc/nginx/sites-enabled/${PANEL_DOMAIN}"
-                nginx -t && systemctl reload nginx
+                nginx -t && systemctl reload nginx || log_warn 'Nginx: ошибка конфига, reload пропущен'
 
                 # SSL для поддомена — обязательный шаг для HTTPS
                 if [[ -n "${LE_EMAIL:-}" ]]; then
@@ -356,9 +362,12 @@ EOF
                 else
                     if ask_yes_no "Выпустить SSL для ${PANEL_DOMAIN}?"; then
                         read -r -p "$(echo -e "${CYAN}Email для Let\'s Encrypt: ${RESET}")" LE_EMAIL
-                        certbot --nginx -d "${PANEL_DOMAIN}" \
-                            --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect
+                        if certbot --nginx -d "${PANEL_DOMAIN}" \
+                            --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect; then
                         log_ok "SSL для ${PANEL_DOMAIN} выпущен."
+                    else
+                        log_warn "SSL для ${PANEL_DOMAIN} не выпущен — проверьте DNS и повторите: certbot --nginx -d ${PANEL_DOMAIN}"
+                    fi
                     fi
                 fi
             fi
@@ -569,6 +578,61 @@ EOF
     fi
 }
 
+# ─── ПРОВЕРКА ДОСТУПНОСТИ ПАНЕЛИ И ЗАКРЫТИЕ ПОРТА 5000 ───────────────────────
+check_panel_and_close_port() {
+    [[ "${AMNEZIA_INSTALLED:-false}" == "false" ]] && return
+    [[ -z "${PANEL_DOMAIN:-}" ]] && return
+
+    echo
+    echo -e "${BOLD}════════ Проверка доступности панели по HTTPS ════════${RESET}"
+    log_info "Проверяю https://${PANEL_DOMAIN} ..."
+
+    HTTP_CODE=$(curl -fsSL --max-time 15 --retry 3 --retry-delay 5 \
+        -o /dev/null -w "%{http_code}" "https://${PANEL_DOMAIN}" 2>/dev/null || echo "000")
+
+    if [[ "$HTTP_CODE" =~ ^(200|301|302|303|401|403)$ ]]; then
+        log_ok "Панель доступна по HTTPS (HTTP ${HTTP_CODE})."
+
+        # Закрыть порт 5000 в UFW
+        if ufw status 2>/dev/null | grep -q "5000"; then
+            ufw delete allow 5000/tcp 2>/dev/null || true
+            ufw delete allow 5000      2>/dev/null || true
+            log_ok "Порт 5000 закрыт в UFW."
+        fi
+
+        # Убедиться что контейнер слушает только на 127.0.0.1
+        CURRENT_BIND=$(grep -A1 "ports:" /opt/amnezia-panel/docker-compose.yml \
+            | grep -oP "[\d.]+(?=:${PANEL_PORT:-5000}:5000)" | head -1)
+        if [[ "$CURRENT_BIND" != "127.0.0.1" ]]; then
+            log_info "Перепривязываю контейнер на 127.0.0.1:${PANEL_PORT:-5000}..."
+            sed -i "s|[0-9.]*:${PANEL_PORT:-5000}:5000|127.0.0.1:${PANEL_PORT:-5000}:5000|" \
+                /opt/amnezia-panel/docker-compose.yml
+            docker compose -f /opt/amnezia-panel/docker-compose.yml up -d --no-deps
+            log_ok "Прямой доступ по порту 5000 закрыт — только через HTTPS."
+        else
+            log_ok "Контейнер уже привязан к 127.0.0.1 — всё в порядке."
+        fi
+
+        echo -e "${GREEN}  ✔  Панель доступна: https://${PANEL_DOMAIN}${RESET}"
+    else
+        log_warn "Панель недоступна по HTTPS (код: ${HTTP_CODE})."
+        echo -e "${YELLOW}  Возможные причины:${RESET}"
+        echo "    • DNS ещё не распространился (подождите 5-10 мин)"
+        echo "    • SSL-сертификат не выпущен для ${PANEL_DOMAIN}"
+        echo "    • Nginx не перезагружен"
+        echo
+        echo -e "${YELLOW}  Диагностика:${RESET}"
+        echo "    curl -I https://${PANEL_DOMAIN}"
+        echo "    systemctl status nginx"
+        echo "    docker ps | grep amnezia"
+        echo
+        echo -e "${YELLOW}  Когда панель заработает по HTTPS, закройте порт 5000:${RESET}"
+        echo "    ufw delete allow 5000/tcp"
+        echo "    sed -i 's|0.0.0.0:5000:5000|127.0.0.1:5000:5000|' /opt/amnezia-panel/docker-compose.yml"
+        echo "    docker compose -f /opt/amnezia-panel/docker-compose.yml up -d"
+    fi
+}
+
 # ─── ИТОГ ─────────────────────────────────────────────────────────────────────
 print_summary() {
     echo
@@ -605,6 +669,165 @@ print_summary() {
     log_info "Лог установки сохранён в /var/log/vps_setup.log"
 }
 
+
+# ─── УСТАНОВКА КОМАНДЫ MYSERVERINFO ──────────────────────────────────────────
+install_myserverinfo() {
+    log_info "Устанавливаю команду myserverinfo..."
+
+    MENU_PATH="/usr/local/bin/myserverinfo"
+
+    cat > "${MENU_PATH}" << 'MENUEOF'
+#!/usr/bin/env bash
+# myserverinfo — интерактивное меню состояния сервера
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; BOLD='\033[1m'
+DIM='\033[2m'; RESET='\033[0m'
+
+detect_panel_domain() {
+    grep -rl "127.0.0.1:5000" /etc/nginx/sites-enabled/ 2>/dev/null \
+        | xargs grep -h "server_name" 2>/dev/null \
+        | grep -oP 'server_name\s+\K\S+' | head -1
+}
+PANEL_DOMAIN=$(detect_panel_domain)
+
+print_header() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    printf "  ║  SERVER INFO  •  %-30s  ║\n" "$(hostname)"
+    printf "  ║  %-47s  ║\n" "$(date '+%d.%m.%Y %H:%M:%S')  •  $(uptime -p)"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+divider() { echo -e "${DIM}  ──────────────────────────────────────────────${RESET}"; }
+
+press_back() {
+    echo; divider
+    echo -e "  ${DIM}Нажмите ${RESET}${BOLD}Enter${RESET}${DIM} для возврата в меню...${RESET}"
+    read -r
+}
+
+show_nginx() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  NGINX${RESET}"; divider
+    systemctl is-active --quiet nginx \
+        && echo -e "  Служба:  ${GREEN}● работает${RESET}" \
+        || echo -e "  Служба:  ${RED}✖ остановлена${RESET}"
+    echo -e "  Версия:  ${CYAN}$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')${RESET}"
+    divider
+    echo -e "  ${BOLD}Виртуальные хосты:${RESET}"
+    for f in /etc/nginx/sites-enabled/*; do
+        SN=$(grep -m1 "server_name" "$f" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        SSL=$( grep -q "ssl_certificate" "$f" 2>/dev/null && echo "${GREEN}🔒 HTTPS${RESET}" || echo "${YELLOW}HTTP${RESET}" )
+        echo -e "    ${CYAN}$(basename "$f")${RESET}  →  ${SN}  ${SSL}"
+    done
+    divider
+    echo -e "  ${BOLD}Последние 10 ошибок:${RESET}"
+    tail -10 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Лог пуст${RESET}"
+    divider
+    echo -e "  ${BOLD}Топ-5 IP (access.log):${RESET}"
+    awk '{print $1}' /var/log/nginx/access.log 2>/dev/null \
+        | sort | uniq -c | sort -rn | head -5 | awk '{printf "    %6s  %s\n",$1,$2}' \
+        || echo -e "    ${DIM}Нет данных${RESET}"
+    press_back
+}
+
+show_crowdsec() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  CROWDSEC${RESET}"; divider
+    if command -v cscli &>/dev/null; then
+        CSCLI="cscli"
+        systemctl is-active --quiet crowdsec \
+            && echo -e "  Режим:  ${CYAN}нативный${RESET}  ${GREEN}● работает${RESET}" \
+            || echo -e "  Режим:  ${CYAN}нативный${RESET}  ${RED}✖ остановлен${RESET}"
+    elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^crowdsec$"; then
+        CSCLI="docker exec crowdsec cscli"
+        echo -e "  Режим:  ${CYAN}Docker${RESET}  ${GREEN}● работает${RESET}"
+    else
+        echo -e "  ${RED}CrowdSec не обнаружен.${RESET}"; press_back; return
+    fi
+    divider
+    echo -e "  ${BOLD}Активные блокировки:${RESET}"
+    DECISIONS=$($CSCLI decisions list 2>/dev/null)
+    echo "$DECISIONS" | grep -q "No active" \
+        && echo -e "    ${GREEN}Нет активных блокировок${RESET}" \
+        || echo "$DECISIONS" | head -20 | sed 's/^/    /'
+    divider
+    echo -e "  ${BOLD}Последние 5 тревог:${RESET}"
+    $CSCLI alerts list --limit 5 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Нет данных${RESET}"
+    divider
+    echo -e "  ${BOLD}Bouncers:${RESET}"
+    $CSCLI bouncers list 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Нет данных${RESET}"
+    press_back
+}
+
+show_amnezia() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  AMNEZIA PANEL${RESET}"; divider
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^amnezia-panel$"; then
+        echo -e "  Контейнер:  ${GREEN}● $(docker inspect --format='{{.State.Status}}' amnezia-panel 2>/dev/null)${RESET}"
+        echo -e "  Образ:      ${CYAN}$(docker inspect --format='{{.Config.Image}}' amnezia-panel 2>/dev/null)${RESET}"
+        HTTP_LOCAL=$(curl -so /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:5000 2>/dev/null || echo "000")
+        [[ "$HTTP_LOCAL" =~ ^(200|301|302|401|403)$ ]] \
+            && echo -e "  Локальный:  ${GREEN}✔ HTTP ${HTTP_LOCAL}${RESET}" \
+            || echo -e "  Локальный:  ${RED}✖ не отвечает${RESET}"
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            HTTP_EXT=$(curl -so /dev/null -w "%{http_code}" --max-time 10 "https://${PANEL_DOMAIN}" 2>/dev/null || echo "000")
+            [[ "$HTTP_EXT" =~ ^(200|301|302|401|403)$ ]] \
+                && echo -e "  HTTPS:      ${GREEN}✔ https://${PANEL_DOMAIN}${RESET}" \
+                || echo -e "  HTTPS:      ${RED}✖ не отвечает${RESET}"
+        fi
+        divider
+        echo -e "  ${BOLD}Ресурсы:${RESET}"
+        docker stats amnezia-panel --no-stream \
+            --format "    CPU: {{.CPUPerc}}   RAM: {{.MemUsage}} ({{.MemPerc}})" 2>/dev/null
+        divider
+        echo -e "  ${BOLD}Последние 15 строк лога:${RESET}"
+        docker logs amnezia-panel --tail 15 2>/dev/null | sed 's/^/    /'
+        divider
+        [[ -n "$PANEL_DOMAIN" ]] && echo -e "  ${GREEN}${BOLD}URL: https://${PANEL_DOMAIN}${RESET}"
+    else
+        echo -e "  ${RED}✖ Контейнер не запущен${RESET}"
+        echo -e "  ${YELLOW}Запуск: docker compose -f /opt/amnezia-panel/docker-compose.yml up -d${RESET}"
+    fi
+    press_back
+}
+
+main_menu() {
+    while true; do
+        print_header
+        NGX_S=$(  systemctl is-active nginx    2>/dev/null || echo "inactive")
+        AMZ_N=$(  docker ps --format '{{.Names}}' 2>/dev/null | grep -c "amnezia-panel" || echo 0)
+        CS_N=$(   systemctl is-active crowdsec 2>/dev/null || echo "inactive")
+        CS_D=$(   docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^crowdsec$"     || echo 0)
+        [[ "$NGX_S" == "active"  ]] && N="${GREEN}●${RESET}" || N="${RED}●${RESET}"
+        [[ "$AMZ_N" -gt 0        ]] && A="${GREEN}●${RESET}" || A="${RED}●${RESET}"
+        ( [[ "$CS_N" == "active" ]] || [[ "$CS_D" -gt 0 ]] ) && C="${GREEN}●${RESET}" || C="${RED}●${RESET}"
+        echo -e "  ${BOLD}1${RESET}  ${N}  Состояние Nginx"
+        echo -e "  ${BOLD}2${RESET}  ${C}  Блокировки CrowdSec"
+        echo -e "  ${BOLD}3${RESET}  ${A}  Панель Amnezia"
+        echo; divider
+        echo -e "  ${BOLD}0${RESET}  ${DIM}Выйти${RESET}"; echo
+        read -r -p "$(echo -e "  ${CYAN}→ ${RESET}")" CH
+        case "$CH" in
+            1) show_nginx    ;;
+            2) show_crowdsec ;;
+            3) show_amnezia  ;;
+            0|q|Q) echo -e "\n  ${DIM}До свидания.${RESET}\n"; exit 0 ;;
+            *) echo -e "  ${RED}Неверный выбор.${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+main_menu
+MENUEOF
+
+    chmod +x "${MENU_PATH}"
+    log_ok "Команда myserverinfo установлена → введите: myserverinfo"
+}
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
     # Сохранять вывод в лог
@@ -635,6 +858,9 @@ main() {
     install_amnezia_panel  # ШАГ 4
     install_crowdsec    # ШАГ 5
     enable_bbr          # ШАГ 6
+
+    check_panel_and_close_port  # Проверка HTTPS и закрытие порта 5000
+    install_myserverinfo        # Установка команды myserverinfo
 
     print_summary
 }
