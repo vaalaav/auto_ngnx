@@ -19,4 +19,4 @@
 8. CyberOK Skipa IPs
 9. BBR
    
-Установка: curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/vps_setup.sh -o vps_setup.sh && sudo bash vps_setup.sh
+Установка: curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/vps_setup.sh -o setup-vps.sh && sudo bash vps_setup.sh
