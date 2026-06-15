@@ -568,20 +568,25 @@ enable_bbr() {
     fi
 
     if ask_yes_no "Включить BBR?"; then
-        log_info "Включаю BBR..."
+        log_info "Загружаю и выполняю скрипт включения BBR (VadimBoev/bbr)..."
 
-        # Добавить/обновить параметры ядра
-        SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
-        cat > "${SYSCTL_FILE}" <<'EOF'
+        if wget -qO- https://raw.githubusercontent.com/VadimBoev/bbr/main/enable_bbr.sh | bash; then
+            log_ok "Скрипт BBR выполнен."
+        else
+            log_warn "Не удалось загрузить скрипт BBR (проблема с сетью)."
+            log_warn "Применяю настройки локально как запасной вариант..."
+
+            SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
+            cat > "${SYSCTL_FILE}" <<'EOF'
 # TCP BBR — Google Bottleneck Bandwidth and Round-trip propagation time
 net.core.default_qdisc       = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
+            sysctl -p "${SYSCTL_FILE}" >/dev/null 2>&1
+        fi
 
-        sysctl -p "${SYSCTL_FILE}"
-
-        # Проверка
-        ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
+        # Проверка результата
+        ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         if [[ "$ACTIVE_CC" == "bbr" ]]; then
             log_ok "BBR успешно активирован."
         else
