@@ -31,31 +31,29 @@ banner() {
     echo -e "${RESET}"
 }
 
-# Спрашивает «да/нет» и возвращает 0 (да) или 1 (нет)
-ask_yes_no() {
+# Спрашивает разрешение на действие.
+# Возвращает:
+#   0 — выполнить (да)
+#   1 — пропустить этот шаг (и продолжить со следующим)
+# При выборе «отмена» — завершает установку полностью.
+ask_action() {
     local prompt="$1"
     while true; do
-        read -r -p "$(echo -e "${YELLOW}${prompt} [y/n]: ${RESET}")" ans
+        read -r -p "$(echo -e "${YELLOW}${prompt} [y - да / s - пропустить / c - отмена]: ${RESET}")" ans
         case "${ans,,}" in
-            y|yes|д|да) return 0 ;;
-            n|no|н|нет) return 1 ;;
-            *) echo -e "${RED}Введите y или n.${RESET}" ;;
-        esac
-    done
-}
-
-# Спрашивает «продолжить или выйти»
-ask_continue_or_exit() {
-    echo -e "${YELLOW}Пропустить этот шаг и продолжить, или выйти из установки?${RESET}"
-    while true; do
-        read -r -p "$(echo -e "${YELLOW}[c]ontinue / [e]xit: ${RESET}")" ans
-        case "${ans,,}" in
-            c|continue|п|продолжить) return 0 ;;
-            e|exit|в|выйти)
-                echo -e "${RED}Установка прервана пользователем.${RESET}"
+            y|yes|д|да)
+                return 0
+                ;;
+            s|skip|п|пропустить)
+                return 1
+                ;;
+            c|cancel|о|отмена)
+                echo -e "${RED}Установка отменена пользователем.${RESET}"
                 exit 0
                 ;;
-            *) echo -e "${RED}Введите c или e.${RESET}" ;;
+            *)
+                echo -e "${RED}Введите y, s или c.${RESET}"
+                ;;
         esac
     done
 }
@@ -83,7 +81,7 @@ install_nginx() {
     echo "  Установка и базовая настройка веб-сервера Nginx."
     echo
 
-    if ask_yes_no "Установить Nginx?"; then
+    if ask_action "Установить Nginx?"; then
         log_info "Добавляю официальный репозиторий Nginx (nginx.org)..."
         curl -fsSL https://nginx.org/keys/nginx_signing.key             | gpg --dearmor -o /etc/apt/keyrings/nginx.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/nginx.gpg] https://nginx.org/packages/mainline/ubuntu $(lsb_release -cs) nginx"             > /etc/apt/sources.list.d/nginx.list
@@ -118,7 +116,6 @@ EOF
     else
         log_warn "Nginx пропущен."
         NGINX_INSTALLED=false
-        ask_continue_or_exit
     fi
 }
 
@@ -134,7 +131,7 @@ setup_website() {
         return
     fi
 
-    if ask_yes_no "Установить сайт из вашего GitHub-шаблона?"; then
+    if ask_action "Установить сайт из вашего GitHub-шаблона?"; then
 
         # Спросить домен
         while true; do
@@ -188,7 +185,6 @@ EOF
     else
         log_warn "Установка сайта пропущена."
         DOMAIN=""
-        ask_continue_or_exit
     fi
 }
 
@@ -204,7 +200,7 @@ install_ssl() {
         return
     fi
 
-    if ask_yes_no "Получить SSL-сертификат для ${DOMAIN}?"; then
+    if ask_action "Получить SSL-сертификат для ${DOMAIN}?"; then
         log_info "Устанавливаю Certbot (snap)..."
         snap install --classic certbot 2>/dev/null || true
         ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
@@ -236,7 +232,6 @@ install_ssl() {
     else
         log_warn "SSL пропущен."
         SSL_INSTALLED=false
-        ask_continue_or_exit
     fi
 }
 
@@ -249,7 +244,7 @@ install_amnezia_panel() {
     echo "  Доступ по умолчанию — admin / admin (смените сразу после входа!)"
     echo
 
-    if ask_yes_no "Установить Amnezia Web Panel в Docker?"; then
+    if ask_action "Установить Amnezia Web Panel в Docker?"; then
 
         # ── Установка Docker ──
         if ! command -v docker &>/dev/null; then
@@ -367,7 +362,7 @@ EOF
                         --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect
                     log_ok "SSL для ${PANEL_DOMAIN} выпущен — панель доступна по HTTPS."
                 else
-                    if ask_yes_no "Выпустить SSL для ${PANEL_DOMAIN}?"; then
+                    if ask_action "Выпустить SSL для ${PANEL_DOMAIN}?"; then
                         read -r -p "$(echo -e "${CYAN}Email для Let\'s Encrypt: ${RESET}")" LE_EMAIL
                         if certbot --nginx -d "${PANEL_DOMAIN}" \
                             --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect; then
@@ -398,7 +393,6 @@ EOF
     else
         log_warn "Amnezia Web Panel пропущена."
         AMNEZIA_INSTALLED=false
-        ask_continue_or_exit
     fi
 }
 
@@ -409,7 +403,7 @@ install_crowdsec() {
     echo "  Collaborative IPS с парсерами для Nginx, Docker и SSH."
     echo
 
-    if ask_yes_no "Установить и настроить CrowdSec?"; then
+    if ask_action "Установить и настроить CrowdSec?"; then
 
         # ── Попытка 1: apt через официальный репозиторий ──
         CS_INSTALLED_NATIVE=false
@@ -548,7 +542,6 @@ EOF
         fi
     else
         log_warn "CrowdSec пропущен."
-        ask_continue_or_exit
     fi
 }
 
@@ -567,7 +560,7 @@ enable_bbr() {
         return
     fi
 
-    if ask_yes_no "Включить BBR?"; then
+    if ask_action "Включить BBR?"; then
         log_info "Загружаю и выполняю скрипт включения BBR (VadimBoev/bbr)..."
 
         if wget -qO- https://raw.githubusercontent.com/VadimBoev/bbr/main/enable_bbr.sh | bash; then
@@ -594,7 +587,6 @@ EOF
         fi
     else
         log_warn "BBR пропущен."
-        ask_continue_or_exit
     fi
 }
 
