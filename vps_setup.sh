@@ -51,6 +51,12 @@ CYBEROK_IPSET="cyberok_skipa"                     # имя ipset-набора с
 
 MYSERVERINFO_PATH="/usr/local/bin/myserverinfo"   # путь к команде myserverinfo
 
+# Постоянная копия этого скрипта. Сохраняется при каждом запуске, чтобы
+# команда myserverinfo могла вызывать функции установки компонентов
+# (install_nginx, install_site, install_ssl, install_crowdsec,
+# install_cyberok, enable_bbr) из своего меню действий.
+SETUP_SCRIPT_PATH="/usr/local/bin/myserver-setup.sh"
+
 # --- Переменные, которые сохраняются между запусками скрипта ---
 SITE_DOMAIN=""
 SITE_REPO=""
@@ -154,6 +160,27 @@ EOF
 pause() {
     echo ""
     read -rp "Нажмите Enter, чтобы вернуться в меню..." _unused
+}
+
+# Сохраняет копию текущего скрипта в $SETUP_SCRIPT_PATH.
+# Команда myserverinfo использует эту копию, чтобы по запросу пользователя
+# запускать функции установки компонентов (install_nginx, install_site,
+# install_ssl, install_crowdsec, install_cyberok, enable_bbr).
+#
+# Копирование выполняется только если удалось определить реальный путь
+# к этому файлу, и в нём действительно содержится функция myserverinfo_install
+# (защита от случая запуска через "curl ... | bash", когда $0 указывает
+# на интерпретатор bash, а не на сам скрипт).
+save_self_copy() {
+    local src
+    src=$(readlink -f "$0" 2>/dev/null)
+
+    if [ -n "$src" ] && [ -f "$src" ] && grep -q "myserverinfo_install" "$src" 2>/dev/null; then
+        if [ "$src" != "$SETUP_SCRIPT_PATH" ]; then
+            cp -f "$src" "$SETUP_SCRIPT_PATH" 2>/dev/null
+            chmod +x "$SETUP_SCRIPT_PATH" 2>/dev/null
+        fi
+    fi
 }
 
 ###############################################################################
@@ -874,6 +901,18 @@ CONFIG_FILE="/etc/myserver/config.conf"
 SITE_PATH="/var/www/site"
 CYBEROK_DIR="/opt/CyberOK_Skipa_ips"
 
+# Путь к сохранённой копии основного установочного скрипта. Используется
+# для выполнения функций установки компонентов (install_nginx, install_site,
+# install_ssl, install_crowdsec, install_cyberok, enable_bbr) из меню действий.
+SETUP_SCRIPT="/usr/local/bin/myserver-setup.sh"
+
+# Запущен ли myserverinfo от root - действия (установка/включение/удаление)
+# требуют root-прав, просмотр информации - нет.
+IS_ROOT=0
+if [ "$(id -u)" -eq 0 ]; then
+    IS_ROOT=1
+fi
+
 # Подгружаем сохранённые значения (домен сайта и т.п.)
 SITE_DOMAIN=""
 if [ -f "$CONFIG_FILE" ]; then
@@ -887,6 +926,41 @@ header() {
     echo "  $1"
     echo "=================================================="
     echo ""
+}
+
+# Проверка прав root перед выполнением действия, изменяющего систему.
+# Возвращает 0, если есть root, иначе печатает подсказку и возвращает 1.
+require_root() {
+    if [ "$IS_ROOT" -ne 1 ]; then
+        echo -e "${YELLOW}Для выполнения действий запустите команду с правами root: sudo myserverinfo${NC}"
+        return 1
+    fi
+    return 0
+}
+
+# Запрашивает подтверждение y/N. Возвращает 0 при "да", 1 при "нет"/Enter.
+confirm() {
+    local ans
+    read -rp "$1 [y/N]: " ans
+    case "$ans" in
+        [yYдД]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Запускает функцию установки/настройки компонента из основного скрипта
+# (сохранённого в $SETUP_SCRIPT при последнем запуске setup-vps.sh).
+# Используется для действий "установить" / "обновить", требующих полной
+# логики основного установщика (apt-репозитории, зависимости и т.п.).
+run_setup() {
+    if [ -x "$SETUP_SCRIPT" ]; then
+        "$SETUP_SCRIPT" "$@"
+        return $?
+    else
+        echo -e "${RED}Не найден $SETUP_SCRIPT${NC}"
+        echo "Запустите оригинальный установочный скрипт setup-vps.sh и выберите соответствующий пункт меню."
+        return 1
+    fi
 }
 
 # Определяет, какой процесс реально слушает указанный TCP-порт (IPv4/IPv6).
@@ -1133,6 +1207,333 @@ print_all() {
     print_bbr
 }
 
+###############################################################################
+# ФУНКЦИИ ДЕЙСТВИЙ: установить/включить отсутствующее или отключенное,
+# либо отключить/удалить уже установленное и работающее.
+#
+# Каждая act_* функция возвращает 0, если было выполнено какое-то действие
+# (после чего show_section повторно выведет информацию по разделу), и 1,
+# если пользователь ничего не стал делать.
+###############################################################################
+
+# --- Действия: NGINX ---
+act_nginx() {
+    require_root || return 1
+    echo ""
+
+    if ! command -v nginx >/dev/null 2>&1; then
+        if confirm "Nginx не установлен. Установить его сейчас?"; then
+            run_setup install_nginx
+            return $?
+        fi
+    elif ! systemctl is-active --quiet nginx; then
+        if confirm "Nginx установлен, но не запущен. Запустить и включить автозапуск?"; then
+            if systemctl enable --now nginx; then
+                echo -e "${GREEN}Nginx запущен и включен${NC}"
+                return 0
+            else
+                echo -e "${RED}Не удалось запустить Nginx${NC}"
+                return 1
+            fi
+        fi
+    else
+        echo "Nginx работает. Доступные действия:"
+        echo "  1) Остановить и отключить автозапуск"
+        echo "  2) Удалить Nginx (apt purge)"
+        echo "  0) Ничего не делать"
+        local a
+        read -rp "Выберите действие [0-2]: " a
+        case "$a" in
+            1)
+                if systemctl disable --now nginx; then
+                    echo -e "${GREEN}Nginx остановлен и отключен${NC}"
+                    return 0
+                fi
+                return 1
+                ;;
+            2)
+                if confirm "Точно удалить Nginx и его пакеты?"; then
+                    systemctl disable --now nginx >/dev/null 2>&1
+                    DEBIAN_FRONTEND=noninteractive apt-get purge -y nginx nginx-common >/dev/null 2>&1
+                    echo -e "${GREEN}Nginx удален${NC}"
+                    return 0
+                fi
+                ;;
+            *) ;;
+        esac
+    fi
+    return 1
+}
+
+# --- Действия: сайт ---
+act_site() {
+    require_root || return 1
+    echo ""
+
+    if [ ! -d "${SITE_PATH}/.git" ]; then
+        if confirm "Сайт не настроен. Запустить установку сайта (запрос домена и репозитория)?"; then
+            run_setup install_site
+            local rc=$?
+            # shellcheck disable=SC1090
+            [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+            return $rc
+        fi
+    else
+        if confirm "Обновить сайт из репозитория (git pull) и пересобрать конфигурацию Nginx?"; then
+            run_setup install_site
+            local rc=$?
+            # shellcheck disable=SC1090
+            [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+            return $rc
+        fi
+    fi
+    return 1
+}
+
+# --- Действия: SSL ---
+act_ssl() {
+    require_root || return 1
+    echo ""
+
+    if [ -z "$SITE_DOMAIN" ] || [ ! -d "/etc/letsencrypt/live/${SITE_DOMAIN}" ]; then
+        if confirm "SSL-сертификат не установлен. Получить сертификат Let's Encrypt?"; then
+            run_setup install_ssl
+            local rc=$?
+            # shellcheck disable=SC1090
+            [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+            return $rc
+        fi
+    elif systemctl is-active --quiet certbot.timer; then
+        echo "SSL настроен, автопродление включено. Доступные действия:"
+        echo "  1) Отключить автопродление (certbot.timer)"
+        echo "  2) Удалить сертификат"
+        echo "  0) Ничего не делать"
+        local a
+        read -rp "Выберите действие [0-2]: " a
+        case "$a" in
+            1)
+                if systemctl disable --now certbot.timer; then
+                    echo -e "${GREEN}certbot.timer отключен${NC}"
+                    return 0
+                fi
+                return 1
+                ;;
+            2)
+                if confirm "Точно удалить сертификат для ${SITE_DOMAIN}?"; then
+                    if certbot delete --cert-name "$SITE_DOMAIN" --non-interactive; then
+                        echo -e "${YELLOW}Сертификат удален. Проверьте конфигурацию Nginx (nginx -t)${NC}"
+                        return 0
+                    fi
+                fi
+                ;;
+            *) ;;
+        esac
+    else
+        if confirm "Автопродление сертификата отключено. Включить certbot.timer?"; then
+            if systemctl enable --now certbot.timer; then
+                echo -e "${GREEN}certbot.timer включен${NC}"
+                return 0
+            fi
+            return 1
+        fi
+    fi
+    return 1
+}
+
+# --- Действия: CrowdSec ---
+act_crowdsec() {
+    require_root || return 1
+    echo ""
+
+    if ! command -v cscli >/dev/null 2>&1; then
+        if confirm "CrowdSec не установлен. Установить CrowdSec и firewall bouncer?"; then
+            run_setup install_crowdsec
+            return $?
+        fi
+    elif ! systemctl is-active --quiet crowdsec; then
+        if confirm "CrowdSec установлен, но не запущен. Запустить и включить?"; then
+            if systemctl enable --now crowdsec; then
+                echo -e "${GREEN}CrowdSec запущен${NC}"
+                return 0
+            fi
+            return 1
+        fi
+    else
+        echo "CrowdSec работает. Доступные действия:"
+        echo "  1) Остановить и отключить"
+        echo "  2) Удалить CrowdSec"
+        echo "  0) Ничего не делать"
+        local a
+        read -rp "Выберите действие [0-2]: " a
+        case "$a" in
+            1)
+                if systemctl disable --now crowdsec; then
+                    echo -e "${GREEN}CrowdSec остановлен и отключен${NC}"
+                    return 0
+                fi
+                return 1
+                ;;
+            2)
+                if confirm "Точно удалить CrowdSec?"; then
+                    systemctl disable --now crowdsec >/dev/null 2>&1
+                    DEBIAN_FRONTEND=noninteractive apt-get purge -y crowdsec >/dev/null 2>&1
+                    echo -e "${GREEN}CrowdSec удален${NC}"
+                    return 0
+                fi
+                ;;
+            *) ;;
+        esac
+    fi
+    return 1
+}
+
+# --- Действия: Firewall bouncer ---
+act_bouncer() {
+    require_root || return 1
+    echo ""
+
+    if ! dpkg -s crowdsec-firewall-bouncer-iptables >/dev/null 2>&1; then
+        if confirm "Firewall bouncer не установлен. Установить CrowdSec (включает bouncer)?"; then
+            run_setup install_crowdsec
+            return $?
+        fi
+    elif ! systemctl is-active --quiet crowdsec-firewall-bouncer; then
+        if confirm "Bouncer установлен, но не запущен. Запустить и включить?"; then
+            if systemctl enable --now crowdsec-firewall-bouncer; then
+                echo -e "${GREEN}Bouncer запущен${NC}"
+                return 0
+            fi
+            return 1
+        fi
+    else
+        echo "Firewall bouncer работает. Доступные действия:"
+        echo "  1) Остановить и отключить"
+        echo "  2) Удалить bouncer"
+        echo "  0) Ничего не делать"
+        local a
+        read -rp "Выберите действие [0-2]: " a
+        case "$a" in
+            1)
+                if systemctl disable --now crowdsec-firewall-bouncer; then
+                    echo -e "${GREEN}Bouncer остановлен и отключен${NC}"
+                    return 0
+                fi
+                return 1
+                ;;
+            2)
+                if confirm "Точно удалить firewall bouncer?"; then
+                    systemctl disable --now crowdsec-firewall-bouncer >/dev/null 2>&1
+                    DEBIAN_FRONTEND=noninteractive apt-get purge -y crowdsec-firewall-bouncer-iptables >/dev/null 2>&1
+                    echo -e "${GREEN}Bouncer удален${NC}"
+                    return 0
+                fi
+                ;;
+            *) ;;
+        esac
+    fi
+    return 1
+}
+
+# --- Действия: CyberOK Skipa IPs ---
+act_cyberok() {
+    require_root || return 1
+    echo ""
+
+    if [ ! -d "${CYBEROK_DIR}/.git" ]; then
+        if confirm "CyberOK Skipa IPs не установлен. Установить его?"; then
+            run_setup install_cyberok
+            return $?
+        fi
+    elif ! systemctl is-active --quiet cyberok-update.timer; then
+        if confirm "Репозиторий установлен, но таймер автообновления отключен. Включить?"; then
+            if systemctl enable --now cyberok-update.timer; then
+                echo -e "${GREEN}Таймер cyberok-update.timer включен${NC}"
+                return 0
+            fi
+            return 1
+        fi
+    else
+        echo "CyberOK Skipa IPs работает. Доступные действия:"
+        echo "  1) Отключить таймер автообновления"
+        echo "  2) Полностью удалить (репозиторий, ipset, правило firewall, таймер)"
+        echo "  0) Ничего не делать"
+        local a
+        read -rp "Выберите действие [0-2]: " a
+        case "$a" in
+            1)
+                if systemctl disable --now cyberok-update.timer; then
+                    echo -e "${GREEN}Таймер cyberok-update.timer отключен${NC}"
+                    echo "Правило firewall и ipset останутся активны до перезагрузки сервера."
+                    return 0
+                fi
+                return 1
+                ;;
+            2)
+                if confirm "Точно удалить CyberOK Skipa IPs полностью (репозиторий, ipset, правило iptables, таймер)?"; then
+                    systemctl disable --now cyberok-update.timer >/dev/null 2>&1
+                    rm -f /etc/systemd/system/cyberok-update.timer /etc/systemd/system/cyberok-update.service
+                    systemctl daemon-reload >/dev/null 2>&1
+                    rm -f /usr/local/bin/update-cyberok.sh
+                    iptables -D INPUT -m set --match-set cyberok_skipa src -j DROP 2>/dev/null
+                    ipset destroy cyberok_skipa 2>/dev/null
+                    rm -rf "$CYBEROK_DIR"
+                    echo -e "${GREEN}CyberOK Skipa IPs удален${NC}"
+                    return 0
+                fi
+                ;;
+            *) ;;
+        esac
+    fi
+    return 1
+}
+
+# --- Действия: BBR ---
+act_bbr() {
+    require_root || return 1
+    echo ""
+
+    local cc
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+
+    if [ "$cc" != "bbr" ]; then
+        if confirm "BBR не включен. Включить BBR?"; then
+            run_setup enable_bbr
+            return $?
+        fi
+    else
+        if confirm "BBR включен. Отключить и вернуть congestion control по умолчанию (cubic)?"; then
+            # Удаляем строки, добавленные при включении BBR
+            sed -i '/^net\.core\.default_qdisc=fq$/d' /etc/sysctl.conf
+            sed -i '/^net\.ipv4\.tcp_congestion_control=bbr$/d' /etc/sysctl.conf
+
+            sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+            sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1
+            sysctl -p >/dev/null 2>&1
+
+            echo -e "${GREEN}BBR отключен (congestion control: cubic)${NC}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Выводит информацию по разделу (print_fn), затем предлагает доступное
+# действие (act_fn). Если действие было выполнено - повторно выводит
+# обновлённую информацию по разделу.
+show_section() {
+    local print_fn="$1"
+    local act_fn="$2"
+
+    "$print_fn"
+
+    if "$act_fn"; then
+        echo ""
+        echo "Обновленная информация:"
+        echo ""
+        "$print_fn"
+    fi
+}
+
 # Небольшая пауза перед возвратом в меню
 pause() {
     echo ""
@@ -1144,7 +1545,7 @@ show_menu() {
     while true; do
         echo ""
         echo -e "${CYAN}===========================================================${NC}"
-        echo -e "${CYAN}${BOLD}          MYSERVERINFO - ИНФОРМАЦИЯ О СЕРВЕРЕ${NC}"
+        echo -e "${CYAN}${BOLD}          MYSERVERINFO - ИНФОРМАЦИЯ И УПРАВЛЕНИЕ${NC}"
         echo -e "${CYAN}===========================================================${NC}"
         echo "  1) Вся информация"
         echo "  2) Система (ОС, ядро, CPU, RAM, диск, IP)"
@@ -1157,6 +1558,12 @@ show_menu() {
         echo "  9) BBR"
         echo "  0) Выход"
         echo -e "${CYAN}===========================================================${NC}"
+        if [ "$IS_ROOT" -ne 1 ]; then
+            echo -e "${YELLOW}Запущено без root - доступен только просмотр информации.${NC}"
+            echo -e "${YELLOW}Для управления компонентами (разделы 3-9) запустите: sudo myserverinfo${NC}"
+        else
+            echo "Разделы 3-9: информация + установка/включение/отключение/удаление"
+        fi
         echo ""
 
         local choice
@@ -1166,13 +1573,13 @@ show_menu() {
         case "$choice" in
             1) print_all ;;
             2) print_system ;;
-            3) print_nginx ;;
-            4) print_site ;;
-            5) print_ssl ;;
-            6) print_crowdsec ;;
-            7) print_bouncer ;;
-            8) print_cyberok ;;
-            9) print_bbr ;;
+            3) show_section print_nginx act_nginx ;;
+            4) show_section print_site act_site ;;
+            5) show_section print_ssl act_ssl ;;
+            6) show_section print_crowdsec act_crowdsec ;;
+            7) show_section print_bouncer act_bouncer ;;
+            8) show_section print_cyberok act_cyberok ;;
+            9) show_section print_bbr act_bbr ;;
             0) exit 0 ;;
             *) echo "Некорректный выбор '$choice'. Введите число от 0 до 9." ;;
         esac
@@ -1330,6 +1737,29 @@ main() {
     # Обновляем кэш apt один раз при старте, чтобы дальнейшие установки
     # пакетов из любого пункта меню проходили без отдельного apt-get update.
     apt-get update -y >> "$LOG_FILE" 2>&1
+
+    # Сохраняем копию скрипта для использования командой myserverinfo
+    save_self_copy
+
+    # --- CLI-диспетчер ---
+    # Если скрипт вызван с аргументом - именем одной из функций установки,
+    # выполняем только её и завершаем работу (без интерактивного меню).
+    # Это используется командой myserverinfo для установки/включения
+    # отсутствующих компонентов прямо из её меню, например:
+    #   myserver-setup.sh install_crowdsec
+    local dispatch_functions=(install_nginx install_site install_ssl install_crowdsec install_cyberok enable_bbr)
+    if [ -n "${1:-}" ]; then
+        local fn
+        for fn in "${dispatch_functions[@]}"; do
+            if [ "$1" = "$fn" ]; then
+                "$1"
+                exit $?
+            fi
+        done
+        echo "Неизвестная команда: $1" >&2
+        echo "Доступные команды: ${dispatch_functions[*]}" >&2
+        exit 1
+    fi
 
     show_menu
 }
