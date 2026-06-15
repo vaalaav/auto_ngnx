@@ -1,10 +1,12 @@
 Автоматическая установка на Ubuntu:
-1. Nginx
-2. Шаблон сайта по ссылке с github
-3. SSL сертификат
-4. Панель Amnezia Manager
-5. Crowdsec
-6. Включение BBR
+Установить всё
+Установить/обновить сайт (ngnix)
+Установить/обновить SSL
+Установить/обновить CrowdSec
+Установить/обновить CyberOK Skipa IPs
+Включить BBR
+Показать информацию о сервере
 
+Команда для проверки состояния: myserverinfo
    
-curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/vps_setup.sh -o vps_setup.sh && sudo bash vps_setup.sh
+Установка: curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/vps_setup.sh -o vps_setup.sh && sudo bash vps_setup.sh
