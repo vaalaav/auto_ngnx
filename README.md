@@ -12,152 +12,156 @@
 
 <p align="center">
 
-**Automatic VPS deployment script for Ubuntu**
+Автоматический скрипт для развёртывания и настройки VPS на Ubuntu.
 
-Install and configure **NGINX**, **Website from GitHub**, **Let's Encrypt SSL**, **CrowdSec**, **CyberOK Skipa IPs**, **TCP BBR** and **myserverinfo** in a few minutes.
+Позволяет за несколько минут установить и настроить:
+
+<b>NGINX</b> • <b>HTML-сайт из GitHub</b> • <b>SSL Let's Encrypt</b> • <b>CrowdSec</b> • <b>CyberOK Skipa IPs</b> • <b>TCP BBR</b> • <b>myserverinfo</b>
 
 </p>
 
 ---
 
-# Features
+# Возможности
 
-✔ Install and configure NGINX
+✅ Установка и настройка NGINX
 
-✔ Deploy website directly from GitHub
+✅ Развёртывание сайта из GitHub
 
-✔ Automatic SSL certificate via Let's Encrypt
+✅ Автоматическое получение SSL сертификата Let's Encrypt
 
-✔ Install and configure CrowdSec
+✅ Установка и настройка CrowdSec
 
-✔ Install CyberOK Skipa IPs
+✅ Установка CyberOK Skipa IPs
 
-✔ Enable TCP BBR
+✅ Включение TCP BBR
 
-✔ Install `myserverinfo`
+✅ Установка утилиты `myserverinfo`
 
-✔ Server status monitoring
+✅ Просмотр состояния сервера и сервисов
 
-✔ Interactive menu
+✅ Интерактивное меню
 
 ---
 
-# Screenshots
+# Скриншоты
 
-## Main menu
+## Главное меню
 
-> Add screenshot here:
+Добавьте сюда скриншот:
+
+```markdown
+![Главное меню](images/main-menu.png)
+```
+
+Пример:
 
 ```text
 +--------------------------------+
-|       AUTO NGINX VPS           |
+
+      AUTO NGINX VPS
+
 +--------------------------------+
 
-1. Install everything
+1. Установить всё
 
-2. Install/Update website
+2. Установить/Обновить сайт
 
-3. Install/Update SSL
+3. Установить/Обновить SSL
 
-4. Install/Update CrowdSec
+4. Установить/Обновить CrowdSec
 
-5. Install/Update CyberOK Skipa IPs
+5. Установить/Обновить CyberOK Skipa IPs
 
-6. Enable BBR
+6. Включить BBR
 
-7. Install/Update myserverinfo
+7. Установить/Обновить myserverinfo
 
-8. Show server information
+8. Показать информацию о сервере
 
-0. Exit
-```
-
-Screenshot example:
-
-```markdown
-![Main menu](images/main-menu.png)
+0. Выход
 ```
 
 ---
 
 ## myserverinfo
 
-> Add screenshot here:
+Добавьте сюда скриншот:
 
 ```markdown
 ![myserverinfo](images/myserverinfo.png)
 ```
 
-Example output:
+Пример:
 
 ```text
-====================================
+===================================
 
-Server Information
+Информация о сервере
 
-====================================
+===================================
 
-OS: Ubuntu 24.04
+ОС: Ubuntu 24.04
 
-Kernel: 6.x
+Ядро: 6.x
 
 CPU: Intel Xeon
 
 RAM: 2 GB
 
-Disk: 20 GB
+Диск: 20 GB
 
 IPv4: xxx.xxx.xxx.xxx
 
-------------------------------------
+-----------------------------------
 
-NGINX: Running
+NGINX: Работает
 
-SSL: Installed
+SSL: Установлен
 
-CrowdSec: Running
+CrowdSec: Работает
 
-Firewall Bouncer: Running
+Firewall Bouncer: Работает
 
-CyberOK: Installed
+CyberOK: Установлен
 
-BBR: Enabled
+BBR: Включен
 
-====================================
+===================================
 ```
 
 ---
 
-# Supported OS
+# Поддерживаемые ОС
 
-Recommended:
+Рекомендуется:
 
 - Ubuntu 24.04 LTS
 
-Also supported:
+Также поддерживается:
 
 - Ubuntu 22.04 LTS
 
 ---
 
-# Installed components
+# Устанавливаемые компоненты
 
-| Component | Description |
-|-----------|-------------|
-| NGINX | Stable web server |
-| Website | HTML template from GitHub |
+| Компонент | Назначение |
+|----------|------------|
+| NGINX | Веб-сервер |
+| Website | HTML сайт из GitHub |
 | SSL | Let's Encrypt + Certbot |
-| CrowdSec | Intrusion prevention |
-| Firewall Bouncer | Firewall integration |
-| CyberOK | Trusted IP lists |
-| TCP BBR | TCP congestion control |
-| myserverinfo | Server monitoring |
+| CrowdSec | Защита от атак |
+| Firewall Bouncer | Интеграция CrowdSec с firewall |
+| CyberOK | Списки доверенных IP |
+| TCP BBR | Современный алгоритм TCP |
+| myserverinfo | Мониторинг сервера |
 
 ---
 
-# Quick Start
+# Быстрый старт
 
-Download and run:
+Скачайте и запустите скрипт:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/setup-vps.sh -o setup-vps.sh && sudo bash setup-vps.sh
@@ -165,27 +169,35 @@ curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/setup-vps.sh
 
 ---
 
-# Interactive Menu
+# Главное меню
 
 ```text
-1. Install everything
-2. Install/Update website
-3. Install/Update SSL
-4. Install/Update CrowdSec
-5. Install/Update CyberOK Skipa IPs
-6. Enable BBR
-7. Install/Update myserverinfo
-8. Show server information
-0. Exit
+1. Установить всё
+
+2. Установить/Обновить сайт
+
+3. Установить/Обновить SSL
+
+4. Установить/Обновить CrowdSec
+
+5. Установить/Обновить CyberOK Skipa IPs
+
+6. Включить BBR
+
+7. Установить/Обновить myserverinfo
+
+8. Показать информацию о сервере
+
+0. Выход
 ```
 
 ---
 
-# Menu Description
+# Описание пунктов меню
 
-## 1. Install everything
+## 1. Установить всё
 
-Installs:
+Устанавливает:
 
 - NGINX
 - Website
@@ -198,37 +210,37 @@ Installs:
 
 ---
 
-## 2. Install/Update website
+## 2. Установить/Обновить сайт
 
-Allows:
+Позволяет:
 
-- specify GitHub repository;
-- download website template;
-- update existing site.
+- указать GitHub репозиторий;
+- скачать HTML шаблон;
+- обновить существующий сайт.
 
 ---
 
-## 3. Install/Update SSL
+## 3. Установить/Обновить SSL
 
-Installs:
+Устанавливает:
 
 - Certbot;
-- Let's Encrypt certificate;
-- automatic renewal.
+- SSL сертификат Let's Encrypt;
+- автоматическое продление сертификатов.
 
 ---
 
-## 4. Install/Update CrowdSec
+## 4. Установить/Обновить CrowdSec
 
-Installs:
+Устанавливает:
 
 - CrowdSec Engine;
 - Firewall Bouncer;
-- Linux collection;
-- NGINX collection;
-- SSH collection.
+- коллекцию Linux;
+- коллекцию NGINX;
+- коллекцию SSH.
 
-Useful commands:
+Полезные команды:
 
 ```bash
 sudo cscli metrics
@@ -244,28 +256,28 @@ sudo cscli collections list
 
 ---
 
-## 5. Install/Update CyberOK Skipa IPs
+## 5. Установить/Обновить CyberOK Skipa IPs
 
-Installs and updates trusted IP lists.
+Устанавливает и обновляет список доверенных IP адресов.
 
 ---
 
-## 6. Enable BBR
+## 6. Включить BBR
 
-Enables:
+Включает:
 
 ```text
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 ```
 
-Check:
+Проверить:
 
 ```bash
 sysctl net.ipv4.tcp_congestion_control
 ```
 
-Expected:
+Ожидаемый результат:
 
 ```text
 net.ipv4.tcp_congestion_control = bbr
@@ -273,39 +285,39 @@ net.ipv4.tcp_congestion_control = bbr
 
 ---
 
-## 7. Install/Update myserverinfo
+## 7. Установить/Обновить myserverinfo
 
-Installs:
+После установки доступна команда:
 
 ```bash
 myserverinfo
 ```
 
-Displays:
+Показывает:
 
-- OS
-- Kernel
-- CPU
-- RAM
-- Disk
-- IP addresses
-- NGINX status
-- SSL status
-- CrowdSec status
-- Firewall Bouncer status
-- CyberOK status
-- BBR status
+- ОС;
+- Ядро;
+- CPU;
+- RAM;
+- Диск;
+- IP адреса;
+- состояние NGINX;
+- состояние SSL;
+- состояние CrowdSec;
+- состояние Firewall Bouncer;
+- состояние CyberOK;
+- состояние BBR.
 
 ---
 
-## 8. Show server information
+## 8. Показать информацию о сервере
 
-Menu:
+Доступные разделы:
 
 ```text
-1. All information
+1. Вся информация
 
-2. System
+2. Система
 
 3. NGINX
 
@@ -324,35 +336,35 @@ Menu:
 
 ---
 
-# Requirements
+# Требования
 
-- Ubuntu 22.04 or Ubuntu 24.04
-- Root privileges
-- Internet connection
-- Free ports:
+- Ubuntu 22.04 или Ubuntu 24.04;
+- Root-права;
+- Доступ в Интернет;
+- Свободные порты:
   - 80/tcp
-  - 443/tcp
-- Domain name for SSL
+  - 443/tcp;
+- Доменное имя для SSL.
 
 ---
 
-# Security Recommendations
+# Рекомендации по безопасности
 
-It is recommended to:
+Рекомендуется:
 
-- Disable SSH password authentication;
-- Use SSH keys;
-- Keep the system updated:
+- отключить вход по SSH по паролю;
+- использовать SSH ключи;
+- регулярно обновлять систему:
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 ```
 
-- Use CrowdSec to protect SSH and NGINX.
+- использовать CrowdSec для защиты SSH и NGINX.
 
 ---
 
-# Project Structure
+# Структура проекта
 
 ```text
 auto_ngnx/
@@ -366,43 +378,33 @@ auto_ngnx/
 
 ---
 
-# Roadmap
+# Планы развития
 
-Planned features:
-
-- [ ] Docker installation
-- [ ] Docker Compose installation
-- [ ] Automatic backups
-- [ ] Fail2Ban optional support
-- [ ] Telegram notifications
-- [ ] Automatic updates
-- [ ] WireGuard installation
-- [ ] AmneziaWG support
-- [ ] Reverse Proxy templates
-- [ ] Multi-site support
+- [ ] Установка Docker
+- [ ] Установка Docker Compose
+- [ ] Автоматические резервные копии
+- [ ] Поддержка Fail2Ban
+- [ ] Telegram уведомления
+- [ ] Автоматическое обновление
+- [ ] Установка WireGuard
+- [ ] Поддержка AmneziaWG
+- [ ] Шаблоны Reverse Proxy
+- [ ] Поддержка нескольких сайтов
 
 ---
 
-# Contributing
-
-Contributions, pull requests and suggestions are welcome.
-
-Feel free to open an issue or submit a PR.
-
----
-
-# License
+# Лицензия
 
 MIT License
 
 ---
 
-# Author
+# Автор
 
 **vaalaav**
 
 GitHub:
 
-`https://github.com/vaalaav`
+https://github.com/vaalaav
 
-If this project helped you, please consider giving it a ⭐.
+Если проект оказался полезен, поставьте ⭐.
