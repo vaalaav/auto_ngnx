@@ -140,6 +140,30 @@ ensure_package() {
     return 0
 }
 
+# Помечает каталог $1 как "безопасный" для git (git config --global
+# safe.directory). Это предотвращает ошибку git "detected dubious ownership
+# in repository", которая возникает при выполнении git-команд от root в
+# каталоге, принадлежащем другому пользователю (например, /var/www/site
+# принадлежит www-data после chown в install_site, а git pull при повторном
+# запуске скрипта выполняется от root).
+git_mark_safe_directory() {
+    local dir="$1"
+    if ! git config --global --get-all safe.directory 2>/dev/null | grep -qx "$dir"; then
+        git config --global --add safe.directory "$dir" >> "$LOG_FILE" 2>&1
+    fi
+}
+
+# Выводит на экран последние строки лог-файла - удобно для быстрой
+# диагностики причины ошибки (например, сообщение git pull/clone,
+# certbot, nginx -t и т.п.) без необходимости открывать лог отдельно.
+# shellcheck disable=SC2120
+show_log_tail() {
+    local n="${1:-10}"
+    echo -e "${YELLOW}--- Последние строки лога ($LOG_FILE) ---${NC}"
+    tail -n "$n" "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
+    echo -e "${YELLOW}-----------------------------------------------------------${NC}"
+}
+
 # Сохраняет текущие значения SITE_DOMAIN / SITE_REPO / CERTBOT_EMAIL
 # в файл конфигурации, чтобы их можно было использовать при следующих
 # запусках скрипта (например, при выборе "Установить/обновить SSL"
@@ -276,33 +300,71 @@ install_site() {
     # --- Клонирование или обновление репозитория сайта ---
     mkdir -p /var/www
 
+    # Помечаем каталог сайта как "безопасный" для git. Без этого повторный
+    # git pull от root завершается ошибкой "detected dubious ownership in
+    # repository", т.к. ниже каталог переходит во владение www-data (chown).
+    git_mark_safe_directory "$SITE_PATH"
+
+    # Если каталог уже является git-репозиторием, но его origin указывает
+    # на ДРУГОЙ URL (пользователь изменил URL репозитория) - переносим старый
+    # каталог в backup и клонируем заново из нового репозитория ниже.
     if [ -d "${SITE_PATH}/.git" ]; then
-        # Репозиторий уже клонирован ранее - просто обновляем его
-        msg_step "Каталог $SITE_PATH уже является git-репозиторием, выполняю git pull"
-        git -C "$SITE_PATH" pull >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка при выполнении git pull в $SITE_PATH (см. $LOG_FILE)"
-            return 1
+        local current_origin
+        current_origin=$(git -C "$SITE_PATH" config --get remote.origin.url 2>/dev/null)
+        if [ -n "$current_origin" ] && [ "$current_origin" != "$SITE_REPO" ]; then
+            local backup_path
+            backup_path="${SITE_PATH}.bak.$(date +%s)"
+            msg_warn "URL репозитория изменился (было: $current_origin)"
+            msg_warn "Перемещаю текущий каталог в $backup_path и клонирую новый репозиторий: $SITE_REPO"
+            mv "$SITE_PATH" "$backup_path"
         fi
-        msg_ok "Репозиторий сайта обновлён (git pull)"
+    fi
+
+    if [ -d "${SITE_PATH}/.git" ]; then
+        # Репозиторий уже клонирован ранее (тот же URL) - обновляем его.
+        msg_step "Каталог $SITE_PATH уже является git-репозиторием, выполняю git pull"
+        if git -C "$SITE_PATH" pull >> "$LOG_FILE" 2>&1; then
+            msg_ok "Репозиторий сайта обновлён (git pull)"
+        else
+            # git pull может завершиться ошибкой из-за локальных изменений
+            # (например, права/владелец файлов после предыдущего chown)
+            # или из-за разошедшейся истории (force-push в репозитории).
+            # В этом случае пробуем "жёсткое" обновление: fetch + reset --hard
+            # до состояния удалённой ветки.
+            msg_warn "git pull завершился с ошибкой, пробую git fetch + reset --hard"
+            local current_branch
+            current_branch=$(git -C "$SITE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [ -n "$current_branch" ] \
+                && git -C "$SITE_PATH" fetch origin >> "$LOG_FILE" 2>&1 \
+                && git -C "$SITE_PATH" reset --hard "origin/${current_branch}" >> "$LOG_FILE" 2>&1; then
+                msg_ok "Репозиторий сайта обновлён (git fetch + reset --hard origin/${current_branch})"
+                msg_warn "Любые несохранённые локальные изменения в $SITE_PATH были отброшены"
+            else
+                msg_err "Не удалось обновить репозиторий сайта в $SITE_PATH"
+                show_log_tail
+                return 1
+            fi
+        fi
     else
         # Если каталог существует, но это не git-репозиторий - делаем backup,
         # чтобы не потерять возможные пользовательские данные
         if [ -d "$SITE_PATH" ]; then
-            local backup_path
-            backup_path="${SITE_PATH}.bak.$(date +%s)"
+            local backup_path2
+            backup_path2="${SITE_PATH}.bak.$(date +%s)"
             msg_warn "Каталог $SITE_PATH существует, но не является git-репозиторием."
-            msg_warn "Перемещаю его в $backup_path и клонирую новый репозиторий"
-            mv "$SITE_PATH" "$backup_path"
+            msg_warn "Перемещаю его в $backup_path2 и клонирую новый репозиторий"
+            mv "$SITE_PATH" "$backup_path2"
         fi
 
         msg_step "Клонирование репозитория $SITE_REPO в $SITE_PATH"
         git clone "$SITE_REPO" "$SITE_PATH" >> "$LOG_FILE" 2>&1
         if [ $? -ne 0 ]; then
-            msg_err "Ошибка клонирования репозитория $SITE_REPO (см. $LOG_FILE)"
+            msg_err "Ошибка клонирования репозитория $SITE_REPO"
+            show_log_tail
             return 1
         fi
         msg_ok "Репозиторий сайта успешно клонирован"
+        git_mark_safe_directory "$SITE_PATH"
     fi
 
     # Если в репозитории отсутствует index.html - создаём простую заглушку,
@@ -633,12 +695,23 @@ log "=== Запуск обновления CyberOK Skipa IPs ==="
 
 # --- Шаг 1: обновление git-репозитория ---
 if [ -d "${CYBEROK_DIR}/.git" ]; then
+    # Помечаем каталог как "безопасный" для git (на случай изменения владельца
+    # каталога после установки) - см. git_mark_safe_directory в основном скрипте.
+    git config --global --add safe.directory "$CYBEROK_DIR" 2>/dev/null
+
     cd "$CYBEROK_DIR" || { log "ОШИБКА: не удалось перейти в $CYBEROK_DIR"; exit 1; }
-    git pull >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        log "ПРЕДУПРЕЖДЕНИЕ: git pull завершился с ошибкой, используем текущую версию списка"
-    else
+    if git pull >> "$LOG_FILE" 2>&1; then
         log "Репозиторий успешно обновлён (git pull)"
+    else
+        log "git pull завершился с ошибкой, пробую git fetch + reset --hard"
+        BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ -n "$BRANCH" ] \
+            && git fetch origin >> "$LOG_FILE" 2>&1 \
+            && git reset --hard "origin/${BRANCH}" >> "$LOG_FILE" 2>&1; then
+            log "Репозиторий обновлён (git fetch + reset --hard origin/${BRANCH})"
+        else
+            log "ПРЕДУПРЕЖДЕНИЕ: не удалось обновить репозиторий, используем текущую версию списка"
+        fi
     fi
 else
     log "ОШИБКА: каталог $CYBEROK_DIR отсутствует или не является git-репозиторием"
@@ -756,22 +829,40 @@ install_cyberok() {
     # --- Клонирование или обновление репозитория со списками IP ---
     mkdir -p /opt
 
+    # Помечаем каталог как "безопасный" для git (см. git_mark_safe_directory)
+    git_mark_safe_directory "$CYBEROK_DIR"
+
     if [ -d "${CYBEROK_DIR}/.git" ]; then
         msg_step "Репозиторий CyberOK Skipa IPs уже существует, выполняю git pull"
-        git -C "$CYBEROK_DIR" pull >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка git pull в $CYBEROK_DIR (см. $LOG_FILE)"
-            return 1
+        if git -C "$CYBEROK_DIR" pull >> "$LOG_FILE" 2>&1; then
+            msg_ok "Репозиторий CyberOK Skipa IPs обновлён"
+        else
+            # Аналогично install_site: при ошибке git pull (например, из-за
+            # разошедшейся истории после force-push в репозитории) пробуем
+            # жёсткое обновление до состояния удалённой ветки.
+            msg_warn "git pull завершился с ошибкой, пробую git fetch + reset --hard"
+            local current_branch
+            current_branch=$(git -C "$CYBEROK_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)
+            if [ -n "$current_branch" ] \
+                && git -C "$CYBEROK_DIR" fetch origin >> "$LOG_FILE" 2>&1 \
+                && git -C "$CYBEROK_DIR" reset --hard "origin/${current_branch}" >> "$LOG_FILE" 2>&1; then
+                msg_ok "Репозиторий CyberOK Skipa IPs обновлён (fetch + reset --hard origin/${current_branch})"
+            else
+                msg_err "Не удалось обновить репозиторий CyberOK Skipa IPs в $CYBEROK_DIR"
+                show_log_tail
+                return 1
+            fi
         fi
-        msg_ok "Репозиторий CyberOK Skipa IPs обновлён"
     else
         msg_step "Клонирование репозитория $CYBEROK_REPO в $CYBEROK_DIR"
         git clone "$CYBEROK_REPO" "$CYBEROK_DIR" >> "$LOG_FILE" 2>&1
         if [ $? -ne 0 ]; then
-            msg_err "Ошибка клонирования репозитория CyberOK Skipa IPs (см. $LOG_FILE)"
+            msg_err "Ошибка клонирования репозитория CyberOK Skipa IPs"
+            show_log_tail
             return 1
         fi
         msg_ok "Репозиторий CyberOK Skipa IPs клонирован"
+        git_mark_safe_directory "$CYBEROK_DIR"
     fi
 
     # Репозиторий содержит готовые списки IP/подсетей в каталоге lists/
