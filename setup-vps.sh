@@ -1205,6 +1205,38 @@ print_cert_sans() {
     echo "IPs: ${ips:-н/д}"
 }
 
+# Проверяет, отвечает ли URL $1 по HTTPS, и печатает результат.
+# Различает: успешный ответ (HTTP код), ошибку TLS-соединения
+# (handshake/сертификат) и ошибку соединения (порт закрыт/недоступен/таймаут).
+# -k используется намеренно: нас интересует сам факт TLS-соединения,
+# а не валидность сертификата (это проверяется отдельно по SAN/сроку).
+check_https_url() {
+    local url="$1"
+    local code rc
+
+    code=$(curl -ks -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 "$url" 2>/dev/null)
+    rc=$?
+
+    if [ $rc -eq 0 ] && [ -n "$code" ] && [ "$code" != "000" ]; then
+        echo -e "  ${url} -> ${GREEN}HTTP ${code}${NC}"
+    else
+        case $rc in
+            35|60)
+                echo -e "  ${url} -> ${RED}ошибка TLS-соединения (handshake/сертификат)${NC}"
+                ;;
+            7)
+                echo -e "  ${url} -> ${RED}не удалось подключиться (порт закрыт/недоступен)${NC}"
+                ;;
+            28)
+                echo -e "  ${url} -> ${RED}таймаут соединения${NC}"
+                ;;
+            *)
+                echo -e "  ${url} -> ${RED}ошибка соединения (код curl ${rc})${NC}"
+                ;;
+        esac
+    fi
+}
+
 # --- Раздел: SSL ---
 print_ssl() {
     header "SSL"
@@ -1222,6 +1254,38 @@ print_ssl() {
         echo "Expiration date: н/д"
         echo "Domains: н/д"
         echo "IPs: н/д"
+    fi
+
+    # --- Проверка реальной доступности сайта по HTTPS ---
+    # Помогает выявить ситуацию, когда сертификат выпущен и nginx настроен,
+    # но порт 443 фактически занят другим сервисом (например, 3x-ui/Xray),
+    # а сайт реально работает на другом порту (например, 8443) -
+    # см. раздел NGINX -> "Проверка портов".
+    if [ -n "$SITE_DOMAIN" ] && command -v curl >/dev/null 2>&1; then
+        echo ""
+        echo "Проверка доступности по HTTPS:"
+
+        # Порты, на которых nginx настроен принимать HTTPS (директивы listen ... ssl)
+        local ssl_ports port suffix
+        ssl_ports=""
+        if command -v nginx >/dev/null 2>&1; then
+            ssl_ports=$(nginx -T 2>/dev/null \
+                | grep -E '^\s*listen\s.*ssl' \
+                | sed -E 's/^\s*listen\s+([^;]+);.*/\1/' \
+                | awk '{print $1}' \
+                | sed -E 's/^\[::\]://; s/^.*://' \
+                | sort -un)
+        fi
+        # Если в конфигах не найдено ни одного "listen ... ssl" - проверяем
+        # стандартный 443 (например, чтобы показать саму ошибку соединения).
+        [ -z "$ssl_ports" ] && ssl_ports="443"
+
+        for port in $ssl_ports; do
+            suffix=""
+            [ "$port" != "443" ] && suffix=":${port}"
+            check_https_url "https://${SITE_DOMAIN}${suffix}/"
+            check_https_url "https://www.${SITE_DOMAIN}${suffix}/"
+        done
     fi
 
     # --- Прочие сертификаты Let's Encrypt на сервере (если есть) ---
