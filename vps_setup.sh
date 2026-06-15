@@ -1,1170 +1,883 @@
-#!/bin/bash
-###############################################################################
-#
-#   СКРИПТ АВТОМАТИЧЕСКОЙ УСТАНОВКИ И НАСТРОЙКИ VPS (Ubuntu 24.04 LTS)
-#
-#   Возможности:
-#     - установка и настройка Nginx + сайт из git-репозитория;
-#     - получение и автопродление SSL-сертификата Let's Encrypt;
-#     - установка CrowdSec + firewall-bouncer (iptables/nftables);
-#     - установка блок-листа CyberOK Skipa IPs с автообновлением по таймеру;
-#     - включение BBR (congestion control);
-#     - команда myserverinfo для просмотра состояния сервера.
-#
-#   Скрипт диалоговый, запускается от root, безопасен для повторного запуска.
-#   Все действия логируются в /var/log/myserver-install.log
-#
-###############################################################################
+#!/usr/bin/env bash
+# =============================================================================
+#  VPS Setup Script — Ubuntu 24.04
+#  Компоненты: Nginx · SSL (Certbot) · Amnezia-Web-Panel (Docker)
+#              CrowdSec · BBR
+# =============================================================================
 
-# Не используем "set -e", т.к. это диалоговое меню, и после ошибки одного
-# пункта меню скрипт должен вернуться в меню, а не завершиться полностью.
-# Вместо этого после каждой важной команды проверяем код возврата $?.
-set -o pipefail
+set -uo pipefail
+# Не используем -e: обрабатываем ошибки вручную в каждой функции
 
-###############################################################################
-#                              ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-###############################################################################
-
-# --- Цвета для красивого вывода в терминал ---
+# ─── Цвета ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
-NC='\033[0m'   # сброс цвета (No Color)
+RESET='\033[0m'
 
-# --- Пути и константы ---
-LOG_FILE="/var/log/myserver-install.log"          # общий лог установки
-CONFIG_DIR="/etc/myserver"                        # каталог для хранения конфигурации скрипта
-CONFIG_FILE="${CONFIG_DIR}/config.conf"           # сохранённые домен/репозиторий/email
+# ─── Вспомогательные функции ─────────────────────────────────────────────────
+log_info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+log_ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+log_error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 
-SITE_PATH="/var/www/site"                         # каталог с сайтом
-NGINX_CONF="/etc/nginx/sites-available/site"      # конфиг nginx для сайта
-NGINX_ENABLED="/etc/nginx/sites-enabled/site"     # симлинк на конфиг
-
-CYBEROK_DIR="/opt/CyberOK_Skipa_ips"              # каталог с репозиторием блок-листа
-CYBEROK_REPO="https://github.com/tread-lightly/CyberOK_Skipa_ips.git"
-CYBEROK_UPDATE_SCRIPT="/usr/local/bin/update-cyberok.sh"
-CYBEROK_LOG="/var/log/cyberok-update.log"
-CYBEROK_IPSET="cyberok_skipa"                     # имя ipset-набора с заблокированными подсетями
-
-MYSERVERINFO_PATH="/usr/local/bin/myserverinfo"   # путь к команде myserverinfo
-
-# --- Переменные, которые сохраняются между запусками скрипта ---
-SITE_DOMAIN=""
-SITE_REPO=""
-CERTBOT_EMAIL=""
-
-# Если конфиг уже существует (повторный запуск скрипта) - подгружаем значения,
-# чтобы не спрашивать у пользователя то, что он уже вводил ранее.
-if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-fi
-
-###############################################################################
-#                       ФУНКЦИИ ЛОГИРОВАНИЯ И ВЫВОДА СООБЩЕНИЙ
-###############################################################################
-
-# Записывает сообщение в лог-файл с отметкой времени
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+banner() {
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║           VPS AUTO-SETUP · Ubuntu 24.04                 ║"
+    echo "║  Nginx · SSL · Amnezia Panel · CrowdSec · BBR           ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
 }
 
-# Информационное сообщение (синий цвет)
-msg_info() {
-    echo -e "${BLUE}[ИНФО]${NC} $1"
-    log "[INFO] $1"
-}
-
-# Сообщение об успешном выполнении (зелёный цвет)
-msg_ok() {
-    echo -e "${GREEN}[OK]${NC} $1"
-    log "[OK] $1"
-}
-
-# Предупреждение (жёлтый цвет)
-msg_warn() {
-    echo -e "${YELLOW}[ВНИМАНИЕ]${NC} $1"
-    log "[WARN] $1"
-}
-
-# Сообщение об ошибке (красный цвет)
-msg_err() {
-    echo -e "${RED}[ОШИБКА]${NC} $1"
-    log "[ERROR] $1"
-}
-
-# Заголовок текущего шага установки (голубой цвет, со стрелкой)
-msg_step() {
-    echo -e "${CYAN}==> $1${NC}"
-    log "==> $1"
-}
-
-###############################################################################
-#                          СЛУЖЕБНЫЕ (ВСПОМОГАТЕЛЬНЫЕ) ФУНКЦИИ
-###############################################################################
-
-# Проверка, что скрипт запущен от root
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}Этот скрипт необходимо запускать от пользователя root!${NC}"
-        echo -e "Запустите так: ${BOLD}sudo bash $0${NC}"
-        exit 1
-    fi
-}
-
-# Устанавливает пакет $1, если он ещё не установлен (идемпотентность).
-# Возвращает 0 при успехе, 1 при ошибке.
-ensure_package() {
-    local pkg="$1"
-    if dpkg -s "$pkg" >/dev/null 2>&1; then
-        # пакет уже установлен - ничего не делаем
-        return 0
-    fi
-
-    msg_step "Установка пакета: $pkg"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        msg_err "Не удалось установить пакет $pkg (см. $LOG_FILE)"
-        return 1
-    fi
-    msg_ok "Пакет $pkg установлен"
-    return 0
-}
-
-# Сохраняет текущие значения SITE_DOMAIN / SITE_REPO / CERTBOT_EMAIL
-# в файл конфигурации, чтобы их можно было использовать при следующих
-# запусках скрипта (например, при выборе "Установить/обновить SSL"
-# отдельно от установки сайта).
-save_config() {
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" << EOF
-# Автоматически сгенерированный файл конфигурации.
-# Используется скриптом установки и командой myserverinfo.
-SITE_DOMAIN="$SITE_DOMAIN"
-SITE_REPO="$SITE_REPO"
-CERTBOT_EMAIL="$CERTBOT_EMAIL"
-EOF
-}
-
-# Небольшая пауза с ожиданием Enter - удобно между пунктами меню,
-# чтобы пользователь успел прочитать результат выполнения функции.
-pause() {
-    echo ""
-    read -rp "Нажмите Enter, чтобы вернуться в меню..." _unused
-}
-
-###############################################################################
-#                          1) УСТАНОВКА NGINX И ЗАВИСИМОСТЕЙ
-###############################################################################
-
-install_nginx() {
-    msg_step "Установка веб-сервера Nginx и необходимых пакетов"
-
-    # Обновляем список пакетов apt перед установкой
-    msg_step "Обновление списка пакетов apt"
-    apt-get update -y >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        msg_err "Не удалось выполнить apt-get update"
-        return 1
-    fi
-    msg_ok "Список пакетов apt обновлён"
-
-    # Список пакетов, необходимых для работы сайта
-    local packages=(nginx git curl unzip certbot python3-certbot-nginx)
-
-    local pkg
-    for pkg in "${packages[@]}"; do
-        ensure_package "$pkg" || return 1
-    done
-
-    # Включаем и запускаем nginx (idempotent - если уже включён, команда
-    # просто завершится без ошибки)
-    systemctl enable nginx >> "$LOG_FILE" 2>&1
-    systemctl start nginx >> "$LOG_FILE" 2>&1
-
-    if systemctl is-active --quiet nginx; then
-        msg_ok "Nginx запущен и работает"
-    else
-        msg_err "Nginx не запущен. Проверьте: systemctl status nginx"
-        return 1
-    fi
-
-    # Если установлен и активен ufw - открываем порты 80/443 для Nginx
-    if command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw allow 'Nginx Full' >> "$LOG_FILE" 2>&1
-            msg_ok "Правила UFW для Nginx (порты 80/443) добавлены"
-        fi
-    fi
-
-    msg_ok "Установка Nginx завершена"
-    return 0
-}
-
-###############################################################################
-#                       2) УСТАНОВКА / ОБНОВЛЕНИЕ САЙТА
-###############################################################################
-
-install_site() {
-    msg_step "Настройка сайта"
-
-    # Если nginx не установлен - сначала ставим его
-    if ! command -v nginx >/dev/null 2>&1; then
-        msg_warn "Nginx не найден, выполняю предварительную установку Nginx"
-        install_nginx || return 1
-    fi
-
-    # Убедимся, что git установлен (на случай, если пользователь запускает
-    # только этот пункт меню на уже частично настроенном сервере)
-    ensure_package git || return 1
-
-    # --- Запрос домена у пользователя ---
-    local input_domain
-    read -rp "Введите домен сайта (например: example.com) [${SITE_DOMAIN}]: " input_domain
-    if [ -n "$input_domain" ]; then
-        SITE_DOMAIN="$input_domain"
-    fi
-    if [ -z "$SITE_DOMAIN" ]; then
-        msg_err "Домен не может быть пустым"
-        return 1
-    fi
-
-    # --- Запрос URL git-репозитория с шаблоном сайта ---
-    local input_repo
-    read -rp "Введите URL git-репозитория шаблона сайта [${SITE_REPO}]: " input_repo
-    if [ -n "$input_repo" ]; then
-        SITE_REPO="$input_repo"
-    fi
-    if [ -z "$SITE_REPO" ]; then
-        msg_err "URL репозитория не может быть пустым"
-        return 1
-    fi
-
-    # Сохраняем введённые значения для последующих запусков скрипта
-    save_config
-
-    # --- Клонирование или обновление репозитория сайта ---
-    mkdir -p /var/www
-
-    if [ -d "${SITE_PATH}/.git" ]; then
-        # Репозиторий уже клонирован ранее - просто обновляем его
-        msg_step "Каталог $SITE_PATH уже является git-репозиторием, выполняю git pull"
-        git -C "$SITE_PATH" pull >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка при выполнении git pull в $SITE_PATH (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Репозиторий сайта обновлён (git pull)"
-    else
-        # Если каталог существует, но это не git-репозиторий - делаем backup,
-        # чтобы не потерять возможные пользовательские данные
-        if [ -d "$SITE_PATH" ]; then
-            local backup_path
-            backup_path="${SITE_PATH}.bak.$(date +%s)"
-            msg_warn "Каталог $SITE_PATH существует, но не является git-репозиторием."
-            msg_warn "Перемещаю его в $backup_path и клонирую новый репозиторий"
-            mv "$SITE_PATH" "$backup_path"
-        fi
-
-        msg_step "Клонирование репозитория $SITE_REPO в $SITE_PATH"
-        git clone "$SITE_REPO" "$SITE_PATH" >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка клонирования репозитория $SITE_REPO (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Репозиторий сайта успешно клонирован"
-    fi
-
-    # Если в репозитории отсутствует index.html - создаём простую заглушку,
-    # чтобы сайт сразу открывался в браузере
-    if [ ! -f "${SITE_PATH}/index.html" ]; then
-        msg_warn "Файл ${SITE_PATH}/index.html не найден, создаю заглушку"
-        cat > "${SITE_PATH}/index.html" << EOF
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <title>${SITE_DOMAIN}</title>
-</head>
-<body>
-    <h1>Сайт ${SITE_DOMAIN} успешно настроен</h1>
-    <p>Замените этот файл содержимым из вашего репозитория.</p>
-</body>
-</html>
-EOF
-    fi
-
-    # Выставляем владельца файлов сайта - пользователя nginx (www-data)
-    chown -R www-data:www-data "$SITE_PATH"
-
-    # --- Создание конфигурации Nginx для сайта ---
-    msg_step "Создание конфигурации Nginx: $NGINX_CONF"
-    cat > "$NGINX_CONF" << EOF
-# Конфигурация сгенерирована автоматически скриптом установки.
-server {
-    listen 80;
-    listen [::]:80;
-
-    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
-
-    root ${SITE_PATH};
-    index index.html index.htm;
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    access_log /var/log/nginx/${SITE_DOMAIN}_access.log;
-    error_log  /var/log/nginx/${SITE_DOMAIN}_error.log;
-}
-EOF
-
-    # Создаём симлинк в sites-enabled (если уже существует - пересоздаём)
-    ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
-    msg_ok "Симлинк $NGINX_ENABLED создан"
-
-    # Отключаем дефолтный сайт nginx, чтобы он не конфликтовал по умолчанию
-    if [ -L /etc/nginx/sites-enabled/default ]; then
-        rm -f /etc/nginx/sites-enabled/default
-        msg_ok "Дефолтный конфиг nginx (default) отключён"
-    fi
-
-    # Проверяем синтаксис конфигурации nginx перед перезапуском
-    msg_step "Проверка конфигурации Nginx (nginx -t)"
-    nginx -t >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        msg_err "Конфигурация Nginx содержит ошибки (см. $LOG_FILE)"
-        return 1
-    fi
-    msg_ok "Конфигурация Nginx корректна"
-
-    # Перезапускаем nginx, чтобы применить изменения
-    systemctl restart nginx >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        msg_err "Не удалось перезапустить Nginx"
-        return 1
-    fi
-    msg_ok "Nginx перезапущен с новой конфигурацией"
-
-    msg_ok "Сайт ${SITE_DOMAIN} доступен по HTTP (http://${SITE_DOMAIN})"
-    return 0
-}
-
-###############################################################################
-#                  3) УСТАНОВКА / ОБНОВЛЕНИЕ SSL-СЕРТИФИКАТА
-###############################################################################
-
-install_ssl() {
-    msg_step "Настройка SSL-сертификата Let's Encrypt"
-
-    # Если домен ещё не известен - спрашиваем его у пользователя
-    if [ -z "$SITE_DOMAIN" ]; then
-        local input_domain
-        read -rp "Домен для сайта ещё не настроен. Введите домен: " input_domain
-        if [ -z "$input_domain" ]; then
-            msg_err "Домен не указан, получение сертификата невозможно"
-            return 1
-        fi
-        SITE_DOMAIN="$input_domain"
-        save_config
-    fi
-
-    # Убеждаемся, что certbot установлен
-    if ! command -v certbot >/dev/null 2>&1; then
-        msg_warn "certbot не найден, выполняю предварительную установку Nginx/certbot"
-        install_nginx || return 1
-    fi
-
-    # Запрашиваем email для уведомлений Let's Encrypt (можно пропустить)
-    local input_email
-    read -rp "Email для уведомлений Let's Encrypt (Enter - без email) [${CERTBOT_EMAIL}]: " input_email
-    if [ -n "$input_email" ]; then
-        CERTBOT_EMAIL="$input_email"
-    fi
-    save_config
-
-    # Формируем аргументы certbot в зависимости от того, указан ли email
-    local email_args
-    if [ -n "$CERTBOT_EMAIL" ]; then
-        email_args=(-m "$CERTBOT_EMAIL" --agree-tos --no-eff-email)
-    else
-        email_args=(--register-unsafely-without-email --agree-tos)
-    fi
-
-    # --- Получение / обновление сертификата ---
-    # Сначала пробуем получить сертификат для домена и www.домена
-    msg_step "Получение сертификата для ${SITE_DOMAIN} и www.${SITE_DOMAIN}"
-    certbot --nginx \
-        -d "$SITE_DOMAIN" -d "www.${SITE_DOMAIN}" \
-        "${email_args[@]}" \
-        --redirect --non-interactive >> "$LOG_FILE" 2>&1
-    local result=$?
-
-    if [ $result -ne 0 ]; then
-        # Возможно, www.домен не существует в DNS - пробуем без www
-        msg_warn "Не удалось получить сертификат для www.${SITE_DOMAIN}, пробую только для ${SITE_DOMAIN}"
-        certbot --nginx \
-            -d "$SITE_DOMAIN" \
-            "${email_args[@]}" \
-            --redirect --non-interactive >> "$LOG_FILE" 2>&1
-        result=$?
-    fi
-
-    if [ $result -ne 0 ]; then
-        msg_err "Не удалось получить SSL-сертификат для ${SITE_DOMAIN}."
-        msg_err "Проверьте, что DNS-запись домена указывает на этот сервер, и см. $LOG_FILE"
-        return 1
-    fi
-
-    msg_ok "SSL-сертификат для ${SITE_DOMAIN} получен и подключён к Nginx"
-
-    # --- Проверка таймера автоматического продления сертификатов ---
-    msg_step "Проверка таймера автопродления certbot.timer"
-
-    if systemctl is-enabled --quiet certbot.timer 2>/dev/null; then
-        msg_ok "certbot.timer уже включён (enabled)"
-    else
-        systemctl enable certbot.timer >> "$LOG_FILE" 2>&1
-        if [ $? -eq 0 ]; then
-            msg_ok "certbot.timer включён (enabled)"
-        else
-            msg_err "Не удалось включить certbot.timer"
-            return 1
-        fi
-    fi
-
-    if systemctl is-active --quiet certbot.timer; then
-        msg_ok "certbot.timer активен (автопродление работает)"
-    else
-        systemctl start certbot.timer >> "$LOG_FILE" 2>&1
-        if systemctl is-active --quiet certbot.timer; then
-            msg_ok "certbot.timer запущен"
-        else
-            msg_err "certbot.timer не активен. Проверьте: systemctl status certbot.timer"
-            return 1
-        fi
-    fi
-
-    return 0
-}
-
-###############################################################################
-#                          4) УСТАНОВКА CROWDSEC
-###############################################################################
-
-install_crowdsec() {
-    msg_step "Установка CrowdSec и firewall-bouncer"
-
-    # curl нужен для добавления официального репозитория CrowdSec
-    ensure_package curl || return 1
-
-    # --- Добавление официального репозитория CrowdSec (идемпотентно) ---
-    if find /etc/apt/sources.list.d -maxdepth 1 -iname '*crowdsec*' 2>/dev/null | grep -q .; then
-        msg_ok "Официальный репозиторий CrowdSec уже добавлен"
-    else
-        msg_step "Добавление официального репозитория CrowdSec"
-        curl -s https://install.crowdsec.net | bash >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Не удалось добавить репозиторий CrowdSec (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Репозиторий CrowdSec добавлен"
-    fi
-
-    # Обновляем индекс пакетов после добавления нового репозитория
-    apt-get update -y >> "$LOG_FILE" 2>&1
-
-    # --- Определяем, какой backend межсетевого экрана используется:
-    #     классический iptables (legacy) или iptables через nftables (iptables-nft) ---
-    local fw_backend="iptables"
-    if command -v iptables >/dev/null 2>&1; then
-        if iptables -V 2>/dev/null | grep -qi "nf_tables"; then
-            fw_backend="nftables"
-            msg_info "Обнаружен backend iptables-nft (nf_tables) -> bouncer будет настроен в режиме nftables"
-        else
-            msg_info "Обнаружен классический backend iptables-legacy -> bouncer будет настроен в режиме iptables"
-        fi
-    else
-        msg_warn "Команда iptables не найдена, использую режим bouncer по умолчанию (iptables)"
-    fi
-
-    # --- Установка пакетов crowdsec и crowdsec-firewall-bouncer-iptables ---
-    ensure_package crowdsec || return 1
-    ensure_package crowdsec-firewall-bouncer-iptables || return 1
-
-    # --- Настройка режима работы bouncer в соответствии с обнаруженным backend ---
-    local bouncer_cfg="/etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml"
-    if [ -f "$bouncer_cfg" ]; then
-        if grep -q '^mode:' "$bouncer_cfg"; then
-            sed -i "s/^mode:.*/mode: ${fw_backend}/" "$bouncer_cfg"
-        else
-            echo "mode: ${fw_backend}" >> "$bouncer_cfg"
-        fi
-        msg_ok "crowdsec-firewall-bouncer настроен в режиме: ${fw_backend}"
-    else
-        msg_warn "Файл $bouncer_cfg не найден, пропускаю настройку режима bouncer"
-    fi
-
-    # --- Проверка работы cscli ---
-    if ! command -v cscli >/dev/null 2>&1; then
-        msg_err "Команда cscli не найдена после установки CrowdSec"
-        return 1
-    fi
-
-    msg_step "Версия CrowdSec / cscli"
-    cscli version >> "$LOG_FILE" 2>&1
-    msg_ok "cscli доступен: $(cscli version 2>/dev/null | head -n1)"
-
-    # --- Установка необходимых коллекций правил ---
-    local collections=(crowdsecurity/linux crowdsecurity/nginx crowdsecurity/http-cve)
-    local col
-    for col in "${collections[@]}"; do
-        if cscli collections list 2>/dev/null | grep -q "$col"; then
-            msg_ok "Коллекция $col уже установлена"
-        else
-            msg_step "Установка коллекции $col"
-            cscli collections install "$col" >> "$LOG_FILE" 2>&1
-            if [ $? -eq 0 ]; then
-                msg_ok "Коллекция $col установлена"
-            else
-                msg_warn "Не удалось установить коллекцию $col (см. $LOG_FILE)"
-            fi
-        fi
-    done
-
-    msg_info "Текущий список установленных коллекций:"
-    cscli collections list 2>/dev/null | tee -a "$LOG_FILE"
-
-    # --- Включение и (пере)запуск сервисов ---
-    systemctl enable crowdsec >> "$LOG_FILE" 2>&1
-    systemctl enable crowdsec-firewall-bouncer >> "$LOG_FILE" 2>&1
-
-    systemctl restart crowdsec >> "$LOG_FILE" 2>&1
-    systemctl restart crowdsec-firewall-bouncer >> "$LOG_FILE" 2>&1
-
-    # Даём службам немного времени на инициализацию перед проверкой статуса
-    sleep 2
-
-    if systemctl is-active --quiet crowdsec; then
-        msg_ok "Служба crowdsec активна (enabled + running)"
-    else
-        msg_err "Служба crowdsec не запущена. Проверьте: systemctl status crowdsec"
-        return 1
-    fi
-
-    if systemctl is-active --quiet crowdsec-firewall-bouncer; then
-        msg_ok "Служба crowdsec-firewall-bouncer активна (enabled + running)"
-    else
-        msg_err "Служба crowdsec-firewall-bouncer не запущена. Проверьте: systemctl status crowdsec-firewall-bouncer"
-        return 1
-    fi
-
-    msg_ok "Установка CrowdSec завершена"
-    return 0
-}
-
-###############################################################################
-#               5) УСТАНОВКА БЛОК-ЛИСТА CYBEROK SKIPA IPS
-###############################################################################
-
-# Создаёт исполняемый скрипт /usr/local/bin/update-cyberok.sh,
-# который обновляет git-репозиторий со списком IP, пересобирает ipset
-# и проверяет наличие правила iptables для блокировки этого набора.
-create_cyberok_update_script() {
-    msg_step "Создание скрипта автообновления: $CYBEROK_UPDATE_SCRIPT"
-
-    # Heredoc с кавычками вокруг 'CYBEROK_SCRIPT_EOF' - переменные внутри
-    # НЕ раскрываются на этапе генерации, они должны выполняться внутри
-    # самого скрипта update-cyberok.sh при каждом его запуске.
-    cat > "$CYBEROK_UPDATE_SCRIPT" << 'CYBEROK_SCRIPT_EOF'
-#!/bin/bash
-###############################################################################
-# update-cyberok.sh
-#
-# Автоматическое обновление блок-листа CyberOK Skipa IPs:
-#   1. обновляет git-репозиторий с актуальным списком подсетей;
-#   2. пересобирает ipset-набор cyberok_skipa из файла lists/skipa_cidr.txt;
-#   3. убеждается, что в цепочке INPUT есть правило iptables,
-#      блокирующее трафик с адресов из этого набора.
-#
-# Запускается вручную или systemd-таймером cyberok-update.timer
-###############################################################################
-
-CYBEROK_DIR="/opt/CyberOK_Skipa_ips"
-IPSET_NAME="cyberok_skipa"
-LIST_FILE="${CYBEROK_DIR}/lists/skipa_cidr.txt"
-LOG_FILE="/var/log/cyberok-update.log"
-
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-}
-
-log "=== Запуск обновления CyberOK Skipa IPs ==="
-
-# --- Шаг 1: обновление git-репозитория ---
-if [ -d "${CYBEROK_DIR}/.git" ]; then
-    cd "$CYBEROK_DIR" || { log "ОШИБКА: не удалось перейти в $CYBEROK_DIR"; exit 1; }
-    git pull >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        log "ПРЕДУПРЕЖДЕНИЕ: git pull завершился с ошибкой, используем текущую версию списка"
-    else
-        log "Репозиторий успешно обновлён (git pull)"
-    fi
-else
-    log "ОШИБКА: каталог $CYBEROK_DIR отсутствует или не является git-репозиторием"
-    exit 1
-fi
-
-# --- Шаг 2: проверка наличия файла со списком подсетей ---
-if [ ! -f "$LIST_FILE" ]; then
-    log "ОШИБКА: файл со списком $LIST_FILE не найден"
-    exit 1
-fi
-
-# --- Шаг 3: пересборка ipset-набора через временный набор (atomic swap) ---
-# Используем временный набор, чтобы избежать "дырки" в правилах firewall
-# на время пересборки списка.
-TMP_SET="${IPSET_NAME}_tmp"
-
-ipset create "$TMP_SET" hash:net -exist
-ipset flush "$TMP_SET"
-
-COUNT=0
-while IFS= read -r line; do
-    # Пропускаем пустые строки и строки-комментарии (начинающиеся с #)
-    [[ -z "$line" || "$line" =~ ^# ]] && continue
-    if ipset add "$TMP_SET" "$line" -exist 2>>"$LOG_FILE"; then
-        COUNT=$((COUNT + 1))
-    fi
-done < "$LIST_FILE"
-
-log "Прочитано и добавлено записей во временный набор: $COUNT"
-
-# Создаём основной набор, если он ещё не существует
-if ! ipset list -n | grep -qx "$IPSET_NAME"; then
-    ipset create "$IPSET_NAME" hash:net -exist
-fi
-
-# Атомарно меняем местами содержимое основного и временного наборов
-ipset swap "$TMP_SET" "$IPSET_NAME"
-ipset destroy "$TMP_SET"
-
-log "ipset '$IPSET_NAME' обновлён, актуальное количество записей: $COUNT"
-
-# --- Шаг 4: убеждаемся, что в iptables есть правило блокировки набора ---
-if ! iptables -C INPUT -m set --match-set "$IPSET_NAME" src -j DROP 2>/dev/null; then
-    iptables -I INPUT 1 -m set --match-set "$IPSET_NAME" src -j DROP
-    log "Добавлено правило iptables: DROP для набора $IPSET_NAME"
-else
-    log "Правило iptables для набора $IPSET_NAME уже присутствует"
-fi
-
-log "=== Обновление CyberOK Skipa IPs завершено успешно ==="
-exit 0
-CYBEROK_SCRIPT_EOF
-
-    chmod +x "$CYBEROK_UPDATE_SCRIPT"
-    msg_ok "Скрипт $CYBEROK_UPDATE_SCRIPT создан и сделан исполняемым"
-}
-
-# Создаёт systemd unit и timer для ежедневного запуска update-cyberok.sh в 03:00
-create_cyberok_timer() {
-    msg_step "Создание systemd-сервиса и таймера cyberok-update"
-
-    cat > /etc/systemd/system/cyberok-update.service << EOF
-[Unit]
-Description=Обновление блок-листа CyberOK Skipa IPs
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${CYBEROK_UPDATE_SCRIPT}
-EOF
-
-    cat > /etc/systemd/system/cyberok-update.timer << 'EOF'
-[Unit]
-Description=Ежедневное обновление блок-листа CyberOK Skipa IPs
-
-[Timer]
-# Основной запуск - каждый день в 03:00
-OnCalendar=*-*-* 03:00:00
-# Дополнительный запуск через 2 минуты после загрузки сервера -
-# гарантирует восстановление ipset/iptables-правил после перезагрузки.
-OnBootSec=2min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload >> "$LOG_FILE" 2>&1
-
-    systemctl enable --now cyberok-update.timer >> "$LOG_FILE" 2>&1
-    if [ $? -ne 0 ]; then
-        msg_err "Не удалось включить cyberok-update.timer"
-        return 1
-    fi
-
-    if systemctl is-active --quiet cyberok-update.timer; then
-        msg_ok "Таймер cyberok-update.timer активен (ежедневно в 03:00 + при загрузке)"
-    else
-        msg_err "Таймер cyberok-update.timer не активен. Проверьте: systemctl status cyberok-update.timer"
-        return 1
-    fi
-
-    return 0
-}
-
-install_cyberok() {
-    msg_step "Установка блок-листа CyberOK Skipa IPs"
-
-    # Зависимости: git для клонирования репозитория, ipset для управления списками IP
-    ensure_package git || return 1
-    ensure_package ipset || return 1
-
-    # --- Клонирование или обновление репозитория со списками IP ---
-    mkdir -p /opt
-
-    if [ -d "${CYBEROK_DIR}/.git" ]; then
-        msg_step "Репозиторий CyberOK Skipa IPs уже существует, выполняю git pull"
-        git -C "$CYBEROK_DIR" pull >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка git pull в $CYBEROK_DIR (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Репозиторий CyberOK Skipa IPs обновлён"
-    else
-        msg_step "Клонирование репозитория $CYBEROK_REPO в $CYBEROK_DIR"
-        git clone "$CYBEROK_REPO" "$CYBEROK_DIR" >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка клонирования репозитория CyberOK Skipa IPs (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Репозиторий CyberOK Skipa IPs клонирован"
-    fi
-
-    # Репозиторий содержит готовые списки IP/подсетей в каталоге lists/
-    # (форматы CIDR, Range, CheckPointCSV). Рекомендуемый способ применения -
-    # загрузить список CIDR в ipset и заблокировать его правилом iptables.
-    if [ ! -f "${CYBEROK_DIR}/lists/skipa_cidr.txt" ]; then
-        msg_err "Файл ${CYBEROK_DIR}/lists/skipa_cidr.txt не найден в репозитории"
-        return 1
-    fi
-
-    # --- Создание скрипта автообновления и его первый запуск ---
-    create_cyberok_update_script
-
-    msg_step "Первичное применение списка блокировки CyberOK Skipa IPs"
-    bash "$CYBEROK_UPDATE_SCRIPT"
-    if [ $? -ne 0 ]; then
-        msg_err "Ошибка при первичном применении правил CyberOK (см. $CYBEROK_LOG)"
-        return 1
-    fi
-    msg_ok "Правила блокировки CyberOK Skipa IPs применены (ipset: $CYBEROK_IPSET)"
-
-    # --- Создание ежедневного systemd-таймера обновления ---
-    create_cyberok_timer || return 1
-
-    msg_ok "Установка CyberOK Skipa IPs завершена"
-    return 0
-}
-
-###############################################################################
-#                              6) ВКЛЮЧЕНИЕ BBR
-###############################################################################
-
-enable_bbr() {
-    msg_step "Включение TCP BBR (congestion control)"
-
-    local current_cc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    msg_info "Текущий congestion control: ${current_cc:-неизвестно}"
-
-    if [ "$current_cc" = "bbr" ]; then
-        msg_ok "BBR уже включён, дополнительных действий не требуется"
-    else
-        msg_step "Добавление параметров BBR в /etc/sysctl.conf"
-
-        # Добавляем/обновляем net.core.default_qdisc=fq
-        if grep -q '^net\.core\.default_qdisc' /etc/sysctl.conf; then
-            sed -i 's/^net\.core\.default_qdisc.*/net.core.default_qdisc=fq/' /etc/sysctl.conf
-        else
-            echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        fi
-
-        # Добавляем/обновляем net.ipv4.tcp_congestion_control=bbr
-        if grep -q '^net\.ipv4\.tcp_congestion_control' /etc/sysctl.conf; then
-            sed -i 's/^net\.ipv4\.tcp_congestion_control.*/net.ipv4.tcp_congestion_control=bbr/' /etc/sysctl.conf
-        else
-            echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        fi
-
-        msg_step "Применение настроек sysctl (sysctl -p)"
-        sysctl -p >> "$LOG_FILE" 2>&1
-        if [ $? -ne 0 ]; then
-            msg_err "Ошибка применения sysctl -p (см. $LOG_FILE)"
-            return 1
-        fi
-        msg_ok "Параметры sysctl применены"
-    fi
-
-    # --- Проверка наличия модуля ядра tcp_bbr ---
-    if lsmod | grep -q '^tcp_bbr'; then
-        msg_ok "Модуль ядра tcp_bbr загружен"
-    else
-        msg_warn "Модуль tcp_bbr не найден в lsmod, пробую загрузить вручную (modprobe)"
-        modprobe tcp_bbr 2>>"$LOG_FILE"
-        if lsmod | grep -q '^tcp_bbr'; then
-            msg_ok "Модуль tcp_bbr успешно загружен"
-        else
-            msg_warn "Модуль tcp_bbr не отображается в lsmod (возможно, BBR встроен в ядро монолитно)"
-        fi
-    fi
-
-    # --- Итоговая проверка ---
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [ "$current_cc" = "bbr" ]; then
-        msg_ok "BBR активирован. net.ipv4.tcp_congestion_control = ${current_cc}"
-    else
-        msg_err "BBR не активирован. net.ipv4.tcp_congestion_control = ${current_cc:-неизвестно}"
-        msg_err "Возможно, требуется перезагрузка сервера для применения настроек"
-        return 1
-    fi
-
-    return 0
-}
-
-###############################################################################
-#                  7) УСТАНОВКА КОМАНДЫ myserverinfo
-###############################################################################
-
-myserverinfo_install() {
-    msg_step "Установка команды myserverinfo"
-
-    # Heredoc обёрнут в кавычки 'MYSERVERINFO_EOF' - переменные ($SITE_DOMAIN
-    # и т.п.) НЕ раскрываются здесь, они будут вычисляться каждый раз
-    # при запуске команды myserverinfo (через source конфигурационного файла).
-    cat > "$MYSERVERINFO_PATH" << 'MYSERVERINFO_EOF'
-#!/bin/bash
-###############################################################################
-# myserverinfo
-#
-# Выводит сводную информацию о текущем состоянии сервера:
-# ОС, ядро, нагрузка, nginx, сайт, SSL, CrowdSec, firewall bouncer,
-# CyberOK Skipa IPs, BBR.
-###############################################################################
-
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-CONFIG_FILE="/etc/myserver/config.conf"
-SITE_PATH="/var/www/site"
-CYBEROK_DIR="/opt/CyberOK_Skipa_ips"
-
-# Подгружаем сохранённые значения (домен, репозиторий сайта, email certbot)
-SITE_DOMAIN=""
-SITE_REPO=""
-if [ -f "$CONFIG_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-fi
-
-echo "=================================================="
-echo "                SERVER INFORMATION"
-echo "=================================================="
-echo ""
-
-# --- Общая информация об ОС / ядре / нагрузке ---
-echo "OS:"
-if [ -f /etc/os-release ]; then
-    grep -m1 PRETTY_NAME /etc/os-release | cut -d'"' -f2
-else
-    echo "неизвестно"
-fi
-echo ""
-
-echo "Kernel:"
-uname -r
-echo ""
-
-echo "Uptime:"
-uptime -p 2>/dev/null || uptime
-echo ""
-
-echo "CPU:"
-CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d':' -f2 | sed 's/^ *//')
-CPU_CORES=$(nproc)
-echo "${CPU_MODEL:-неизвестно} (${CPU_CORES} ядра/потока)"
-echo ""
-
-echo "RAM:"
-free -h | awk '/^Mem:/ {print "использовано "$3" из "$2}'
-echo ""
-
-echo "Disk:"
-df -h / | awk 'NR==2 {print "использовано "$3" из "$2" ("$5")"}'
-echo ""
-
-echo "IP:"
-hostname -I | awk '{print $1}'
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- NGINX ---
-echo "NGINX:"
-if command -v nginx >/dev/null 2>&1; then
-    echo -e "Installed: ${GREEN}YES${NC}"
-    if systemctl is-active --quiet nginx; then
-        echo -e "Status: ${GREEN}ACTIVE${NC}"
-    else
-        echo -e "Status: ${RED}INACTIVE${NC}"
-    fi
-    echo "Version: $(nginx -v 2>&1 | sed 's#.*nginx/##')"
-else
-    echo -e "Installed: ${RED}NO${NC}"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- SITE ---
-echo "SITE:"
-echo "Domain: ${SITE_DOMAIN:-не настроен}"
-echo "Path: $SITE_PATH"
-if [ -d "${SITE_PATH}/.git" ]; then
-    REPO_URL=$(git -C "$SITE_PATH" config --get remote.origin.url 2>/dev/null)
-    LAST_UPDATE=$(git -C "$SITE_PATH" log -1 --format=%cd --date=local 2>/dev/null)
-    echo "Git repository: ${REPO_URL:-н/д}"
-    echo "Last update: ${LAST_UPDATE:-н/д}"
-else
-    echo "Git repository: н/д"
-    echo "Last update: н/д"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- SSL ---
-echo "SSL:"
-if [ -n "$SITE_DOMAIN" ] && [ -d "/etc/letsencrypt/live/${SITE_DOMAIN}" ]; then
-    CERT_FILE="/etc/letsencrypt/live/${SITE_DOMAIN}/fullchain.pem"
-    echo -e "Installed: ${GREEN}YES${NC}"
-    echo "Certificate: $CERT_FILE"
-    EXP_DATE=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d'=' -f2)
-    echo "Expiration date: ${EXP_DATE:-н/д}"
-else
-    echo -e "Installed: ${RED}NO${NC}"
-    echo "Certificate: н/д"
-    echo "Expiration date: н/д"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- CROWDSEC ---
-echo "CROWDSEC:"
-if command -v cscli >/dev/null 2>&1; then
-    echo -e "Installed: ${GREEN}YES${NC}"
-    if systemctl is-active --quiet crowdsec; then
-        echo -e "Status: ${GREEN}ACTIVE${NC}"
-    else
-        echo -e "Status: ${RED}INACTIVE${NC}"
-    fi
-    echo "Version: $(cscli version 2>/dev/null | head -n1)"
-    echo "Collections:"
-    cscli collections list -o raw 2>/dev/null | tail -n +2 | awk -F',' '{print "  - "$1}'
-else
-    echo -e "Installed: ${RED}NO${NC}"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- FIREWALL BOUNCER ---
-echo "FIREWALL BOUNCER:"
-if dpkg -s crowdsec-firewall-bouncer-iptables >/dev/null 2>&1; then
-    echo -e "Installed: ${GREEN}YES${NC}"
-    if systemctl is-active --quiet crowdsec-firewall-bouncer; then
-        echo -e "Status: ${GREEN}ACTIVE${NC}"
-    else
-        echo -e "Status: ${RED}INACTIVE${NC}"
-    fi
-else
-    echo -e "Installed: ${RED}NO${NC}"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- CYBEROK ---
-echo "CYBEROK:"
-if [ -d "${CYBEROK_DIR}/.git" ]; then
-    echo -e "Installed: ${GREEN}YES${NC}"
-    echo "Repository: $(git -C "$CYBEROK_DIR" config --get remote.origin.url 2>/dev/null)"
-    echo "Last update: $(git -C "$CYBEROK_DIR" log -1 --format=%cd --date=local 2>/dev/null)"
-    if systemctl is-active --quiet cyberok-update.timer; then
-        echo -e "Timer: ${GREEN}ACTIVE${NC}"
-    else
-        echo -e "Timer: ${RED}INACTIVE${NC}"
-    fi
-else
-    echo -e "Installed: ${RED}NO${NC}"
-    echo "Repository: н/д"
-    echo "Last update: н/д"
-    echo "Timer: н/д"
-fi
-echo ""
-
-echo "--------------------------------------------------"
-
-# --- BBR ---
-echo "BBR:"
-CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-if [ "$CURRENT_CC" = "bbr" ]; then
-    echo -e "Enabled: ${GREEN}YES${NC}"
-else
-    echo -e "Enabled: ${RED}NO${NC}"
-fi
-echo "Current congestion control: ${CURRENT_CC:-неизвестно}"
-echo ""
-echo "=================================================="
-MYSERVERINFO_EOF
-
-    chmod +x "$MYSERVERINFO_PATH"
-    msg_ok "Команда myserverinfo установлена в $MYSERVERINFO_PATH"
-    msg_info "Запустите её командой: myserverinfo"
-    return 0
-}
-
-###############################################################################
-#                     ФУНКЦИЯ "УСТАНОВИТЬ ВСЁ" (ПУНКТ 1 МЕНЮ)
-###############################################################################
-
-install_all() {
-    msg_step "Запуск полной установки и настройки сервера"
-
-    local had_errors=0
-
-    install_nginx       || had_errors=1
-    install_site        || had_errors=1
-
-    # SSL может не получиться, если DNS-запись домена ещё не указывает
-    # на этот сервер - не считаем это фатальной ошибкой всей установки,
-    # но предупреждаем пользователя.
-    if ! install_ssl; then
-        msg_warn "Этап SSL пропущен/завершился с ошибкой. Проверьте DNS-записи домена"
-        msg_warn "и повторно выберите пункт меню '3) Установить/обновить SSL'"
-    fi
-
-    install_crowdsec    || had_errors=1
-    install_cyberok     || had_errors=1
-    enable_bbr          || had_errors=1
-    myserverinfo_install || had_errors=1
-
-    echo ""
-    if [ "$had_errors" -eq 0 ]; then
-        msg_ok "Полная установка завершена успешно!"
-    else
-        msg_warn "Установка завершена, но некоторые этапы завершились с ошибками."
-        msg_warn "Подробности смотрите в логе: $LOG_FILE"
-    fi
-}
-
-###############################################################################
-#                                  ГЛАВНОЕ МЕНЮ
-###############################################################################
-
-show_menu() {
+# Спрашивает «да/нет» и возвращает 0 (да) или 1 (нет)
+ask_yes_no() {
+    local prompt="$1"
     while true; do
-        echo ""
-        echo -e "${CYAN}===========================================================${NC}"
-        echo -e "${CYAN}${BOLD}     МЕНЮ УСТАНОВКИ И НАСТРОЙКИ VPS (Ubuntu 24.04)${NC}"
-        echo -e "${CYAN}===========================================================${NC}"
-        echo "  1) Установить всё"
-        echo "  2) Установить/обновить сайт"
-        echo "  3) Установить/обновить SSL"
-        echo "  4) Установить/обновить CrowdSec"
-        echo "  5) Установить/обновить CyberOK Skipa IPs"
-        echo "  6) Включить BBR"
-        echo "  7) Показать информацию о сервере"
-        echo "  8) Выход"
-        echo -e "${CYAN}===========================================================${NC}"
-        echo ""
-
-        local choice
-        read -rp "Выберите пункт меню [1-8]: " choice
-
-        case "$choice" in
-            1)
-                install_all
-                pause
-                ;;
-            2)
-                install_site
-                pause
-                ;;
-            3)
-                install_ssl
-                pause
-                ;;
-            4)
-                install_crowdsec
-                pause
-                ;;
-            5)
-                install_cyberok
-                pause
-                ;;
-            6)
-                enable_bbr
-                pause
-                ;;
-            7)
-                # Гарантируем, что команда myserverinfo установлена,
-                # затем сразу выводим её результат.
-                myserverinfo_install >/dev/null
-                echo ""
-                "$MYSERVERINFO_PATH"
-                pause
-                ;;
-            8)
-                msg_info "Завершение работы скрипта"
-                exit 0
-                ;;
-            *)
-                msg_warn "Некорректный выбор '$choice'. Введите число от 1 до 8."
-                ;;
+        read -r -p "$(echo -e "${YELLOW}${prompt} [y/n]: ${RESET}")" ans
+        case "${ans,,}" in
+            y|yes|д|да) return 0 ;;
+            n|no|н|нет) return 1 ;;
+            *) echo -e "${RED}Введите y или n.${RESET}" ;;
         esac
     done
 }
 
-###############################################################################
-#                                ТОЧКА ВХОДА
-###############################################################################
+# Спрашивает «продолжить или выйти»
+ask_continue_or_exit() {
+    echo -e "${YELLOW}Пропустить этот шаг и продолжить, или выйти из установки?${RESET}"
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}[c]ontinue / [e]xit: ${RESET}")" ans
+        case "${ans,,}" in
+            c|continue|п|продолжить) return 0 ;;
+            e|exit|в|выйти)
+                echo -e "${RED}Установка прервана пользователем.${RESET}"
+                exit 0
+                ;;
+            *) echo -e "${RED}Введите c или e.${RESET}" ;;
+        esac
+    done
+}
 
+# Проверяет, что скрипт запущен от root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Запустите скрипт от имени root: sudo bash $0"
+        exit 1
+    fi
+}
+
+# Базовое обновление системы
+system_update() {
+    log_info "Обновление списков пакетов..."
+    apt-get update -qq
+    apt-get install -y -qq curl wget git ufw snapd software-properties-common \
+        ca-certificates gnupg lsb-release apt-transport-https 2>/dev/null
+}
+
+# ─── 1. NGINX ─────────────────────────────────────────────────────────────────
+install_nginx() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 1: Nginx ════════════════${RESET}"
+    echo "  Установка и базовая настройка веб-сервера Nginx."
+    echo
+
+    if ask_yes_no "Установить Nginx?"; then
+        log_info "Добавляю официальный репозиторий Nginx (nginx.org)..."
+        curl -fsSL https://nginx.org/keys/nginx_signing.key             | gpg --dearmor -o /etc/apt/keyrings/nginx.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/nginx.gpg] https://nginx.org/packages/mainline/ubuntu $(lsb_release -cs) nginx"             > /etc/apt/sources.list.d/nginx.list
+        apt-get update -qq
+
+        NGINX_VER=$(apt-cache madison nginx 2>/dev/null             | grep "nginx.org" | head -1 | awk '{print $3}')
+        log_info "Устанавливаю Nginx ${NGINX_VER}..."
+        apt-get install -y nginx="${NGINX_VER}" 2>/dev/null             || apt-get install -y nginx  # fallback если версия не определилась
+        log_ok "Nginx $(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+') установлен."
+
+        # Включить и запустить
+        systemctl enable nginx
+        systemctl start nginx
+
+        # Базовая конфигурация безопасности
+        cat > /etc/nginx/conf.d/security.conf <<'EOF'
+server_tokens off;
+server_names_hash_bucket_size 128;
+add_header X-Frame-Options SAMEORIGIN;
+add_header X-Content-Type-Options nosniff;
+add_header X-XSS-Protection "1; mode=block";
+add_header Referrer-Policy "strict-origin-when-cross-origin";
+EOF
+
+        # Открыть порты в UFW
+        if command -v ufw &>/dev/null; then
+            ufw allow "Nginx Full" 2>/dev/null || true
+        fi
+
+        log_ok "Nginx установлен и запущен."
+        NGINX_INSTALLED=true
+    else
+        log_warn "Nginx пропущен."
+        NGINX_INSTALLED=false
+        ask_continue_or_exit
+    fi
+}
+
+# ─── 2. САЙТ из GitHub ────────────────────────────────────────────────────────
+setup_website() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 2: Установка сайта из GitHub ════════════════${RESET}"
+    echo "  Клонирование вашего шаблона сайта и настройка Nginx-хоста."
+    echo
+
+    if ! $NGINX_INSTALLED; then
+        log_warn "Nginx не установлен — шаг пропускается."
+        return
+    fi
+
+    if ask_yes_no "Установить сайт из вашего GitHub-шаблона?"; then
+
+        # Спросить домен
+        while true; do
+            read -r -p "$(echo -e "${CYAN}Введите ваш домен (например, example.com): ${RESET}")" DOMAIN
+            [[ -n "$DOMAIN" ]] && break
+            echo -e "${RED}Домен не может быть пустым.${RESET}"
+        done
+
+        # Спросить ссылку на репозиторий
+        while true; do
+            read -r -p "$(echo -e "${CYAN}Ссылка на репозиторий GitHub (https://github.com/...): ${RESET}")" REPO_URL
+            [[ -n "$REPO_URL" ]] && break
+            echo -e "${RED}Ссылка не может быть пустой.${RESET}"
+        done
+
+        WEBROOT="/var/www/${DOMAIN}"
+        log_info "Клонирую репозиторий в ${WEBROOT}..."
+        rm -rf "${WEBROOT}"
+        git clone "${REPO_URL}" "${WEBROOT}"
+        chown -R www-data:www-data "${WEBROOT}"
+        find "${WEBROOT}" -type d -exec chmod 755 {} \;
+        find "${WEBROOT}" -type f -exec chmod 644 {} \;
+
+        # Nginx vhost
+        cat > "/etc/nginx/sites-available/${DOMAIN}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    root ${WEBROOT};
+    index index.html index.htm index.php;
+
+    access_log /var/log/nginx/${DOMAIN}_access.log;
+    error_log  /var/log/nginx/${DOMAIN}_error.log;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    # Запретить доступ к скрытым файлам
+    location ~ /\. {
+        deny all;
+    }
+}
+EOF
+
+        ln -sf "/etc/nginx/sites-available/${DOMAIN}" "/etc/nginx/sites-enabled/${DOMAIN}"
+        nginx -t && systemctl reload nginx || log_warn 'Nginx: ошибка конфига, reload пропущен'
+        log_ok "Сайт ${DOMAIN} развёрнут из ${REPO_URL}."
+    else
+        log_warn "Установка сайта пропущена."
+        DOMAIN=""
+        ask_continue_or_exit
+    fi
+}
+
+# ─── 3. SSL (Certbot) ─────────────────────────────────────────────────────────
+install_ssl() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 3: SSL-сертификат (Let's Encrypt) ════════════════${RESET}"
+    echo "  Бесплатный TLS-сертификат через Certbot + автопродление."
+    echo
+
+    if [[ -z "${DOMAIN:-}" ]]; then
+        log_warn "Домен не задан — пропускаю SSL."
+        return
+    fi
+
+    if ask_yes_no "Получить SSL-сертификат для ${DOMAIN}?"; then
+        log_info "Устанавливаю Certbot (snap)..."
+        snap install --classic certbot 2>/dev/null || true
+        ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
+
+        # Email для Let's Encrypt
+        while true; do
+            read -r -p "$(echo -e "${CYAN}Email для Let's Encrypt (уведомления о продлении): ${RESET}")" LE_EMAIL
+            [[ -n "$LE_EMAIL" ]] && break
+            echo -e "${RED}Email не может быть пустым.${RESET}"
+        done
+
+        log_info "Выпускаю сертификат для ${DOMAIN} и www.${DOMAIN}..."
+        if certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" \
+            --non-interactive --agree-tos -m "${LE_EMAIL}" \
+            --redirect; then
+            log_ok "Certbot успешно выпустил сертификат."
+        else
+            log_warn "Certbot завершился с ошибкой (см. /var/log/letsencrypt/letsencrypt.log)."
+            log_warn "Установка продолжается — SSL можно выпустить позже вручную."
+        fi
+
+        # Таймер автопродления уже включён snap-пакетом,
+        # но добавим cron как запасной вариант
+        (crontab -l 2>/dev/null; echo "0 3 * * * /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'") | \
+            sort -u | crontab -
+
+        log_ok "SSL-сертификат выпущен и настроено автопродление."
+        SSL_INSTALLED=true
+    else
+        log_warn "SSL пропущен."
+        SSL_INSTALLED=false
+        ask_continue_or_exit
+    fi
+}
+
+# ─── 4. AMNEZIA-WEB-PANEL (Docker) ────────────────────────────────────────────
+install_amnezia_panel() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 4: Amnezia Web Panel (Docker) ════════════════${RESET}"
+    echo "  Веб-интерфейс управления AmneziaWG и Xray (XTLS-Reality)."
+    echo "  Docker-образ: prvtpro/amnezia-panel"
+    echo "  Доступ по умолчанию — admin / admin (смените сразу после входа!)"
+    echo
+
+    if ask_yes_no "Установить Amnezia Web Panel в Docker?"; then
+
+        # ── Установка Docker ──
+        if ! command -v docker &>/dev/null; then
+            log_info "Docker не найден — устанавливаю..."
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+              https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" \
+              > /etc/apt/sources.list.d/docker.list
+
+            apt-get update -qq
+            apt-get install -y docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin
+            systemctl enable docker
+            systemctl start docker
+            log_ok "Docker установлен."
+        else
+            log_ok "Docker уже установлен."
+        fi
+
+        # ── Порт панели ──
+        PANEL_PORT=5000
+        read -r -p "$(echo -e "${CYAN}Порт для Amnezia Panel [по умолчанию: 5000]: ${RESET}")" _p
+        [[ -n "$_p" ]] && PANEL_PORT="$_p"
+
+        # ── Секретный ключ сессии ──
+        SECRET_KEY=$(openssl rand -hex 32)
+        log_info "Сгенерирован SECRET_KEY для сессий."
+
+        # ── Каталог данных ──
+        PANEL_DATA_DIR="/opt/amnezia-panel"
+        mkdir -p "${PANEL_DATA_DIR}"
+
+        # ── Определить последнюю версию образа ──
+        log_info "Определяю последнюю версию образа с Docker Hub..."
+        PANEL_TAG=$(curl -fsSL \
+            "https://hub.docker.com/v2/repositories/prvtpro/amnezia-panel/tags?page_size=10" \
+            | grep -oP '"name":"\K[^"]+' | grep -E '^[0-9]' | head -1)
+        if [[ -z "$PANEL_TAG" ]]; then
+            log_warn "Не удалось определить версию — использую 'latest'."
+            PANEL_TAG="latest"
+        else
+            log_ok "Найдена версия: ${PANEL_TAG}"
+        fi
+
+        # ── docker-compose.yml ──
+        cat > "${PANEL_DATA_DIR}/docker-compose.yml" <<EOF
+version: "3.8"
+
+services:
+  amnezia-panel:
+    image: prvtpro/amnezia-panel:${PANEL_TAG}
+    container_name: amnezia-panel
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PANEL_PORT}:5000"
+    volumes:
+      - amnezia_data:/app/data
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  amnezia_data:
+EOF
+
+        log_info "Запускаю контейнер Amnezia Panel..."
+        docker compose -f "${PANEL_DATA_DIR}/docker-compose.yml" pull
+        docker compose -f "${PANEL_DATA_DIR}/docker-compose.yml" up -d
+
+        # ── Nginx reverse proxy ──
+        if $NGINX_INSTALLED && [[ -n "${DOMAIN:-}" ]]; then
+            read -r -p "$(echo -e "${CYAN}Поддомен для панели (например, panel.${DOMAIN}): ${RESET}")" PANEL_DOMAIN
+            if [[ -n "$PANEL_DOMAIN" ]]; then
+                cat > "/etc/nginx/sites-available/${PANEL_DOMAIN}" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${PANEL_DOMAIN};
+
+    # Certbot добавит HTTPS-блок автоматически
+    location / {
+        proxy_pass         http://127.0.0.1:${PANEL_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade \$http_upgrade;
+        proxy_set_header   Connection 'upgrade';
+        proxy_set_header   Host \$host;
+        proxy_set_header   X-Real-IP \$remote_addr;
+        proxy_set_header   X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+        client_max_body_size 50M;
+    }
+}
+EOF
+                ln -sf "/etc/nginx/sites-available/${PANEL_DOMAIN}" \
+                       "/etc/nginx/sites-enabled/${PANEL_DOMAIN}"
+                nginx -t && systemctl reload nginx || log_warn 'Nginx: ошибка конфига, reload пропущен'
+
+                # SSL для поддомена — обязательный шаг для HTTPS
+                if [[ -n "${LE_EMAIL:-}" ]]; then
+                    log_info "Выпускаю SSL для ${PANEL_DOMAIN} (HTTPS обязателен для панели)..."
+                    certbot --nginx -d "${PANEL_DOMAIN}" \
+                        --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect
+                    log_ok "SSL для ${PANEL_DOMAIN} выпущен — панель доступна по HTTPS."
+                else
+                    if ask_yes_no "Выпустить SSL для ${PANEL_DOMAIN}?"; then
+                        read -r -p "$(echo -e "${CYAN}Email для Let\'s Encrypt: ${RESET}")" LE_EMAIL
+                        if certbot --nginx -d "${PANEL_DOMAIN}" \
+                            --non-interactive --agree-tos -m "${LE_EMAIL}" --redirect; then
+                        log_ok "SSL для ${PANEL_DOMAIN} выпущен."
+                    else
+                        log_warn "SSL для ${PANEL_DOMAIN} не выпущен — проверьте DNS и повторите: certbot --nginx -d ${PANEL_DOMAIN}"
+                    fi
+                    fi
+                fi
+            fi
+        fi
+
+        # ── Открыть порт только если нет Nginx ──
+        if ! $NGINX_INSTALLED; then
+            ufw allow "${PANEL_PORT}/tcp" 2>/dev/null || true
+            log_info "Порт ${PANEL_PORT} открыт в UFW."
+        fi
+
+        log_ok "Amnezia Web Panel запущена."
+        if [[ -n "${PANEL_DOMAIN:-}" ]]; then
+            echo -e "${YELLOW}  ▶  URL панели: https://${PANEL_DOMAIN}${RESET}"
+        else
+            echo -e "${YELLOW}  ▶  URL панели: http://127.0.0.1:${PANEL_PORT} (только локально)${RESET}"
+        fi
+        echo -e "${YELLOW}  ▶  Логин: admin  |  Пароль: admin${RESET}"
+        echo -e "${RED}  ⚠  НЕМЕДЛЕННО смените пароль после первого входа!${RESET}"
+        AMNEZIA_INSTALLED=true
+    else
+        log_warn "Amnezia Web Panel пропущена."
+        AMNEZIA_INSTALLED=false
+        ask_continue_or_exit
+    fi
+}
+
+# ─── 5. CROWDSEC ──────────────────────────────────────────────────────────────
+install_crowdsec() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 5: CrowdSec ════════════════${RESET}"
+    echo "  Collaborative IPS с парсерами для Nginx, Docker и SSH."
+    echo
+
+    if ask_yes_no "Установить и настроить CrowdSec?"; then
+
+        # ── Попытка 1: apt через официальный репозиторий ──
+        CS_INSTALLED_NATIVE=false
+        log_info "Попытка установки CrowdSec через apt..."
+        if curl -s --max-time 15 https://install.crowdsec.net | bash &&            apt-get install -y --no-install-recommends crowdsec crowdsec-firewall-bouncer-nftables 2>/dev/null; then
+            CS_INSTALLED_NATIVE=true
+            log_ok "CrowdSec установлен через apt."
+        else
+            log_warn "Apt-установка не удалась (возможно, CDN заблокирован). Переключаюсь на Docker..."
+        fi
+
+        if $CS_INSTALLED_NATIVE; then
+            # ── Нативная установка: парсеры ──
+            cscli hub update
+            cscli collections install crowdsecurity/linux crowdsecurity/sshd
+            $NGINX_INSTALLED && cscli collections install crowdsecurity/nginx
+            ${AMNEZIA_INSTALLED:-false} && cscli collections install crowdsecurity/docker-logs 2>/dev/null || true
+
+            # ── Настройка acquis.yaml ──
+            ACQUIS_FILE="/etc/crowdsec/acquis.yaml"
+            grep -q "/var/log/auth.log" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
+
+---
+filenames:
+  - /var/log/auth.log
+labels:
+  type: syslog
+ACQ
+
+            if $NGINX_INSTALLED; then
+                grep -q "/var/log/nginx" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
+
+---
+filenames:
+  - /var/log/nginx/*.log
+labels:
+  type: nginx
+ACQ
+            fi
+
+            if ${AMNEZIA_INSTALLED:-false}; then
+                grep -q "amnezia-panel" "${ACQUIS_FILE}" 2>/dev/null || cat >> "${ACQUIS_FILE}" <<'ACQ'
+
+---
+source: docker
+container_name:
+  - amnezia-panel
+labels:
+  type: nginx
+ACQ
+            fi
+
+            systemctl enable crowdsec crowdsec-firewall-bouncer
+            systemctl restart crowdsec crowdsec-firewall-bouncer
+            log_ok "CrowdSec (нативный) запущен."
+            cscli collections list
+
+        else
+            # ── Установка через Docker (fallback при недоступном CDN) ──
+            log_info "Устанавливаю CrowdSec в Docker..."
+            # Получить последний стабильный тег
+            CS_TAG=$(curl -fsSL                 "https://hub.docker.com/v2/repositories/crowdsecurity/crowdsec/tags?page_size=20"                 2>/dev/null | grep -oP '"name":"\K[^"]+'                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            CS_TAG="${CS_TAG:-latest}"
+            log_ok "CrowdSec Docker тег: ${CS_TAG}"
+
+            BOUNCER_TAG=$(curl -fsSL                 "https://hub.docker.com/v2/repositories/crowdsecurity/cs-firewall-bouncer/tags?page_size=20"                 2>/dev/null | grep -oP '"name":"\K[^"]+'                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            BOUNCER_TAG="${BOUNCER_TAG:-latest}"
+            log_ok "CrowdSec Bouncer тег: ${BOUNCER_TAG}"
+
+            # Собрать список коллекций
+            CS_COLLECTIONS="crowdsecurity/linux crowdsecurity/sshd"
+            $NGINX_INSTALLED && CS_COLLECTIONS="${CS_COLLECTIONS} crowdsecurity/nginx"
+
+            mkdir -p /opt/crowdsec/data /opt/crowdsec/config /opt/crowdsec/acquis.d
+
+            # acquis.yaml для Docker-контейнера
+            ACQUIS_FILE="/opt/crowdsec/config/acquis.yaml"
+            cat > "${ACQUIS_FILE}" <<EOF
+---
+filenames:
+  - /var/log/auth.log
+labels:
+  type: syslog
+EOF
+            if $NGINX_INSTALLED; then
+                cat >> "${ACQUIS_FILE}" <<EOF
+
+---
+filenames:
+  - /var/log/nginx/*.log
+labels:
+  type: nginx
+EOF
+            fi
+            if ${AMNEZIA_INSTALLED:-false}; then
+                cat >> "${ACQUIS_FILE}" <<EOF
+
+---
+source: docker
+container_name:
+  - amnezia-panel
+labels:
+  type: nginx
+EOF
+            fi
+
+            # Запустить CrowdSec
+            docker run -d                 --name crowdsec                 --restart unless-stopped                 --network host                 -e COLLECTIONS="${CS_COLLECTIONS}"                 -v /var/log:/var/log:ro                 -v /var/run/docker.sock:/var/run/docker.sock:ro                 -v /opt/crowdsec/data:/var/lib/crowdsec/data                 -v /opt/crowdsec/config:/etc/crowdsec                 crowdsecurity/crowdsec:${CS_TAG}
+
+            log_info "Ожидаю запуска CrowdSec (15 сек)..."
+            sleep 15
+
+            # Получить API-ключ и запустить bouncer
+            CS_API_KEY=$(docker exec crowdsec cscli bouncers add nftables-bouncer -o raw 2>/dev/null || echo "")
+            if [[ -n "$CS_API_KEY" ]]; then
+                docker run -d                     --name crowdsec-bouncer                     --restart unless-stopped                     --network host                     --privileged                     -e CROWDSEC_LAPI_URL=http://127.0.0.1:8080                     -e CROWDSEC_LAPI_KEY="${CS_API_KEY}"                     crowdsecurity/cs-firewall-bouncer:${BOUNCER_TAG}
+                log_ok "CrowdSec Bouncer запущен."
+            else
+                log_warn "Не удалось получить API-ключ для bouncer — добавьте вручную: docker exec crowdsec cscli bouncers add mybouncer"
+            fi
+
+            log_ok "CrowdSec (Docker) установлен."
+            docker exec crowdsec cscli collections list 2>/dev/null || true
+        fi
+
+        echo
+        echo -e "${CYAN}  Полезные команды CrowdSec:${RESET}"
+        if $CS_INSTALLED_NATIVE; then
+            echo "    cscli decisions list    — активные блокировки"
+            echo "    cscli alerts list       — история тревог"
+            echo "    cscli metrics           — статистика"
+        else
+            echo "    docker exec crowdsec cscli decisions list"
+            echo "    docker exec crowdsec cscli alerts list"
+            echo "    docker exec crowdsec cscli metrics"
+        fi
+    else
+        log_warn "CrowdSec пропущен."
+        ask_continue_or_exit
+    fi
+}
+
+# ─── 6. BBR ───────────────────────────────────────────────────────────────────
+enable_bbr() {
+    echo
+    echo -e "${BOLD}════════════════ ШАГ 6: BBR (TCP-оптимизация) ════════════════${RESET}"
+    echo "  Алгоритм Google BBR увеличивает пропускную способность TCP."
+    echo
+
+    CURRENT_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    echo "  Текущий алгоритм: ${CURRENT_CC}"
+
+    if [[ "$CURRENT_CC" == "bbr" ]]; then
+        log_ok "BBR уже включён — пропускаю."
+        return
+    fi
+
+    if ask_yes_no "Включить BBR?"; then
+        log_info "Включаю BBR..."
+
+        # Добавить/обновить параметры ядра
+        SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
+        cat > "${SYSCTL_FILE}" <<'EOF'
+# TCP BBR — Google Bottleneck Bandwidth and Round-trip propagation time
+net.core.default_qdisc       = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+
+        sysctl -p "${SYSCTL_FILE}"
+
+        # Проверка
+        ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
+        if [[ "$ACTIVE_CC" == "bbr" ]]; then
+            log_ok "BBR успешно активирован."
+        else
+            log_warn "Не удалось активировать BBR (ядро может не поддерживать). Текущий: ${ACTIVE_CC}"
+        fi
+    else
+        log_warn "BBR пропущен."
+        ask_continue_or_exit
+    fi
+}
+
+# ─── ПРОВЕРКА ДОСТУПНОСТИ ПАНЕЛИ И ЗАКРЫТИЕ ПОРТА 5000 ───────────────────────
+check_panel_and_close_port() {
+    [[ "${AMNEZIA_INSTALLED:-false}" == "false" ]] && return
+    [[ -z "${PANEL_DOMAIN:-}" ]] && return
+
+    echo
+    echo -e "${BOLD}════════ Проверка доступности панели по HTTPS ════════${RESET}"
+    log_info "Проверяю https://${PANEL_DOMAIN} ..."
+
+    HTTP_CODE=$(curl -fsSL --max-time 15 --retry 3 --retry-delay 5 \
+        -o /dev/null -w "%{http_code}" "https://${PANEL_DOMAIN}" 2>/dev/null || echo "000")
+
+    if [[ "$HTTP_CODE" =~ ^(200|301|302|303|401|403)$ ]]; then
+        log_ok "Панель доступна по HTTPS (HTTP ${HTTP_CODE})."
+
+        # Закрыть порт 5000 в UFW
+        if ufw status 2>/dev/null | grep -q "5000"; then
+            ufw delete allow 5000/tcp 2>/dev/null || true
+            ufw delete allow 5000      2>/dev/null || true
+            log_ok "Порт 5000 закрыт в UFW."
+        fi
+
+        # Убедиться что контейнер слушает только на 127.0.0.1
+        CURRENT_BIND=$(grep -A1 "ports:" /opt/amnezia-panel/docker-compose.yml \
+            | grep -oP "[\d.]+(?=:${PANEL_PORT:-5000}:5000)" | head -1)
+        if [[ "$CURRENT_BIND" != "127.0.0.1" ]]; then
+            log_info "Перепривязываю контейнер на 127.0.0.1:${PANEL_PORT:-5000}..."
+            sed -i "s|[0-9.]*:${PANEL_PORT:-5000}:5000|127.0.0.1:${PANEL_PORT:-5000}:5000|" \
+                /opt/amnezia-panel/docker-compose.yml
+            docker compose -f /opt/amnezia-panel/docker-compose.yml up -d --no-deps
+            log_ok "Прямой доступ по порту 5000 закрыт — только через HTTPS."
+        else
+            log_ok "Контейнер уже привязан к 127.0.0.1 — всё в порядке."
+        fi
+
+        echo -e "${GREEN}  ✔  Панель доступна: https://${PANEL_DOMAIN}${RESET}"
+    else
+        log_warn "Панель недоступна по HTTPS (код: ${HTTP_CODE})."
+        echo -e "${YELLOW}  Возможные причины:${RESET}"
+        echo "    • DNS ещё не распространился (подождите 5-10 мин)"
+        echo "    • SSL-сертификат не выпущен для ${PANEL_DOMAIN}"
+        echo "    • Nginx не перезагружен"
+        echo
+        echo -e "${YELLOW}  Диагностика:${RESET}"
+        echo "    curl -I https://${PANEL_DOMAIN}"
+        echo "    systemctl status nginx"
+        echo "    docker ps | grep amnezia"
+        echo
+        echo -e "${YELLOW}  Когда панель заработает по HTTPS, закройте порт 5000:${RESET}"
+        echo "    ufw delete allow 5000/tcp"
+        echo "    sed -i 's|0.0.0.0:5000:5000|127.0.0.1:5000:5000|' /opt/amnezia-panel/docker-compose.yml"
+        echo "    docker compose -f /opt/amnezia-panel/docker-compose.yml up -d"
+    fi
+}
+
+# ─── ИТОГ ─────────────────────────────────────────────────────────────────────
+print_summary() {
+    echo
+    echo -e "${BOLD}${GREEN}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║                  УСТАНОВКА ЗАВЕРШЕНА                    ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+
+    echo -e "${BOLD}Итог:${RESET}"
+    echo -e "  Nginx:              $(${NGINX_INSTALLED:-false}     && echo "${GREEN}✔ установлен${RESET}" || echo "${YELLOW}— пропущен${RESET}")"
+    echo -e "  Сайт (${DOMAIN:-—}): $( [[ -n "${DOMAIN:-}" ]]     && echo "${GREEN}✔ развёрнут${RESET}"  || echo "${YELLOW}— пропущен${RESET}")"
+    echo -e "  SSL:                $(${SSL_INSTALLED:-false}       && echo "${GREEN}✔ выпущен${RESET}"    || echo "${YELLOW}— пропущен${RESET}")"
+    echo -e "  Amnezia Panel:      $(${AMNEZIA_INSTALLED:-false}   && echo "${GREEN}✔ запущена${RESET}"   || echo "${YELLOW}— пропущена${RESET}")"
+    CROWDSEC_OK=false
+    systemctl is-active --quiet crowdsec 2>/dev/null && CROWDSEC_OK=true
+    echo -e "  CrowdSec:           $(${CROWDSEC_OK}               && echo "${GREEN}✔ активен${RESET}"    || echo "${YELLOW}— пропущен${RESET}")"
+    BBR_ACTIVE=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    echo -e "  BBR:                $([[ "$BBR_ACTIVE" == "bbr" ]] && echo "${GREEN}✔ включён${RESET}"    || echo "${YELLOW}— не активен${RESET}")"
+
+    if ${AMNEZIA_INSTALLED:-false}; then
+        echo
+        echo -e "${BOLD}Amnezia Panel:${RESET}"
+        if [[ -n "${PANEL_DOMAIN:-}" ]]; then
+            echo -e "  URL: https://${PANEL_DOMAIN}"
+        else
+            echo -e "  URL: http://<IP>:${PANEL_PORT:-5000}"
+        fi
+        echo -e "  Логин: ${RED}admin${RESET} / Пароль: ${RED}admin${RESET} — ${BOLD}смените немедленно!${RESET}"
+        echo -e "  Данные панели: /opt/amnezia-panel/"
+    fi
+
+    echo
+    log_info "Лог установки сохранён в /var/log/vps_setup.log"
+}
+
+
+# ─── УСТАНОВКА КОМАНДЫ MYSERVERINFO ──────────────────────────────────────────
+install_myserverinfo() {
+    log_info "Устанавливаю команду myserverinfo..."
+
+    MENU_PATH="/usr/local/bin/myserverinfo"
+
+    cat > "${MENU_PATH}" << 'MENUEOF'
+#!/usr/bin/env bash
+# myserverinfo — интерактивное меню состояния сервера
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; BOLD='\033[1m'
+DIM='\033[2m'; RESET='\033[0m'
+
+detect_panel_domain() {
+    grep -rl "127.0.0.1:5000" /etc/nginx/sites-enabled/ 2>/dev/null \
+        | xargs grep -h "server_name" 2>/dev/null \
+        | grep -oP 'server_name\s+\K\S+' | head -1
+}
+PANEL_DOMAIN=$(detect_panel_domain)
+
+print_header() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    printf "  ║  SERVER INFO  •  %-30s  ║\n" "$(hostname)"
+    printf "  ║  %-47s  ║\n" "$(date '+%d.%m.%Y %H:%M:%S')  •  $(uptime -p)"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+divider() { echo -e "${DIM}  ──────────────────────────────────────────────${RESET}"; }
+
+press_back() {
+    echo; divider
+    echo -e "  ${DIM}Нажмите ${RESET}${BOLD}Enter${RESET}${DIM} для возврата в меню...${RESET}"
+    read -r
+}
+
+show_nginx() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  NGINX${RESET}"; divider
+    systemctl is-active --quiet nginx \
+        && echo -e "  Служба:  ${GREEN}● работает${RESET}" \
+        || echo -e "  Служба:  ${RED}✖ остановлена${RESET}"
+    echo -e "  Версия:  ${CYAN}$(nginx -v 2>&1 | grep -oP 'nginx/\K[\d.]+')${RESET}"
+    divider
+    echo -e "  ${BOLD}Виртуальные хосты:${RESET}"
+    for f in /etc/nginx/sites-enabled/*; do
+        SN=$(grep -m1 "server_name" "$f" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        SSL=$( grep -q "ssl_certificate" "$f" 2>/dev/null && echo "${GREEN}🔒 HTTPS${RESET}" || echo "${YELLOW}HTTP${RESET}" )
+        echo -e "    ${CYAN}$(basename "$f")${RESET}  →  ${SN}  ${SSL}"
+    done
+    divider
+    echo -e "  ${BOLD}Последние 10 ошибок:${RESET}"
+    tail -10 /var/log/nginx/error.log 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Лог пуст${RESET}"
+    divider
+    echo -e "  ${BOLD}Топ-5 IP (access.log):${RESET}"
+    awk '{print $1}' /var/log/nginx/access.log 2>/dev/null \
+        | sort | uniq -c | sort -rn | head -5 | awk '{printf "    %6s  %s\n",$1,$2}' \
+        || echo -e "    ${DIM}Нет данных${RESET}"
+    press_back
+}
+
+show_crowdsec() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  CROWDSEC${RESET}"; divider
+    if command -v cscli &>/dev/null; then
+        CSCLI="cscli"
+        systemctl is-active --quiet crowdsec \
+            && echo -e "  Режим:  ${CYAN}нативный${RESET}  ${GREEN}● работает${RESET}" \
+            || echo -e "  Режим:  ${CYAN}нативный${RESET}  ${RED}✖ остановлен${RESET}"
+    elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^crowdsec$"; then
+        CSCLI="docker exec crowdsec cscli"
+        echo -e "  Режим:  ${CYAN}Docker${RESET}  ${GREEN}● работает${RESET}"
+    else
+        echo -e "  ${RED}CrowdSec не обнаружен.${RESET}"; press_back; return
+    fi
+    divider
+    echo -e "  ${BOLD}Активные блокировки:${RESET}"
+    DECISIONS=$($CSCLI decisions list 2>/dev/null)
+    echo "$DECISIONS" | grep -q "No active" \
+        && echo -e "    ${GREEN}Нет активных блокировок${RESET}" \
+        || echo "$DECISIONS" | head -20 | sed 's/^/    /'
+    divider
+    echo -e "  ${BOLD}Последние 5 тревог:${RESET}"
+    $CSCLI alerts list --limit 5 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Нет данных${RESET}"
+    divider
+    echo -e "  ${BOLD}Bouncers:${RESET}"
+    $CSCLI bouncers list 2>/dev/null | sed 's/^/    /' || echo -e "    ${DIM}Нет данных${RESET}"
+    press_back
+}
+
+show_amnezia() {
+    print_header
+    echo -e "  ${BOLD}${BLUE}▶  AMNEZIA PANEL${RESET}"; divider
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^amnezia-panel$"; then
+        echo -e "  Контейнер:  ${GREEN}● $(docker inspect --format='{{.State.Status}}' amnezia-panel 2>/dev/null)${RESET}"
+        echo -e "  Образ:      ${CYAN}$(docker inspect --format='{{.Config.Image}}' amnezia-panel 2>/dev/null)${RESET}"
+        HTTP_LOCAL=$(curl -so /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:5000 2>/dev/null || echo "000")
+        [[ "$HTTP_LOCAL" =~ ^(200|301|302|401|403)$ ]] \
+            && echo -e "  Локальный:  ${GREEN}✔ HTTP ${HTTP_LOCAL}${RESET}" \
+            || echo -e "  Локальный:  ${RED}✖ не отвечает${RESET}"
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            HTTP_EXT=$(curl -so /dev/null -w "%{http_code}" --max-time 10 "https://${PANEL_DOMAIN}" 2>/dev/null || echo "000")
+            [[ "$HTTP_EXT" =~ ^(200|301|302|401|403)$ ]] \
+                && echo -e "  HTTPS:      ${GREEN}✔ https://${PANEL_DOMAIN}${RESET}" \
+                || echo -e "  HTTPS:      ${RED}✖ не отвечает${RESET}"
+        fi
+        divider
+        echo -e "  ${BOLD}Ресурсы:${RESET}"
+        docker stats amnezia-panel --no-stream \
+            --format "    CPU: {{.CPUPerc}}   RAM: {{.MemUsage}} ({{.MemPerc}})" 2>/dev/null
+        divider
+        echo -e "  ${BOLD}Последние 15 строк лога:${RESET}"
+        docker logs amnezia-panel --tail 15 2>/dev/null | sed 's/^/    /'
+        divider
+        [[ -n "$PANEL_DOMAIN" ]] && echo -e "  ${GREEN}${BOLD}URL: https://${PANEL_DOMAIN}${RESET}"
+    else
+        echo -e "  ${RED}✖ Контейнер не запущен${RESET}"
+        echo -e "  ${YELLOW}Запуск: docker compose -f /opt/amnezia-panel/docker-compose.yml up -d${RESET}"
+    fi
+    press_back
+}
+
+main_menu() {
+    while true; do
+        print_header
+        NGX_S=$(  systemctl is-active nginx    2>/dev/null || echo "inactive")
+        AMZ_N=$(  docker ps --format '{{.Names}}' 2>/dev/null | grep -c "amnezia-panel" || echo 0)
+        CS_N=$(   systemctl is-active crowdsec 2>/dev/null || echo "inactive")
+        CS_D=$(   docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^crowdsec$"     || echo 0)
+        [[ "$NGX_S" == "active"  ]] && N="${GREEN}●${RESET}" || N="${RED}●${RESET}"
+        [[ "$AMZ_N" -gt 0        ]] && A="${GREEN}●${RESET}" || A="${RED}●${RESET}"
+        ( [[ "$CS_N" == "active" ]] || [[ "$CS_D" -gt 0 ]] ) && C="${GREEN}●${RESET}" || C="${RED}●${RESET}"
+        echo -e "  ${BOLD}1${RESET}  ${N}  Состояние Nginx"
+        echo -e "  ${BOLD}2${RESET}  ${C}  Блокировки CrowdSec"
+        echo -e "  ${BOLD}3${RESET}  ${A}  Панель Amnezia"
+        echo; divider
+        echo -e "  ${BOLD}0${RESET}  ${DIM}Выйти${RESET}"; echo
+        read -r -p "$(echo -e "  ${CYAN}→ ${RESET}")" CH
+        case "$CH" in
+            1) show_nginx    ;;
+            2) show_crowdsec ;;
+            3) show_amnezia  ;;
+            0|q|Q) echo -e "\n  ${DIM}До свидания.${RESET}\n"; exit 0 ;;
+            *) echo -e "  ${RED}Неверный выбор.${RESET}"; sleep 1 ;;
+        esac
+    done
+}
+
+main_menu
+MENUEOF
+
+    chmod +x "${MENU_PATH}"
+    log_ok "Команда myserverinfo установлена → введите: myserverinfo"
+}
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 main() {
+    # Сохранять вывод в лог
+    exec > >(tee -a /var/log/vps_setup.log) 2>&1
+
     check_root
+    banner
 
-    # Создаём каталоги для логов и конфигурации
-    mkdir -p "$(dirname "$LOG_FILE")"
-    mkdir -p "$CONFIG_DIR"
-    touch "$LOG_FILE"
+    echo -e "${BOLD}Этот скрипт установит компоненты по вашему выбору.${RESET}"
+    echo "  Для каждого шага будет запрошено подтверждение."
+    echo "  При отказе — возможность пропустить или выйти."
+    echo
 
-    log "============================================================"
-    log "Запуск скрипта установки myserver"
-    log "============================================================"
+    # Глобальные флаги
+    NGINX_INSTALLED=false
+    SSL_INSTALLED=false
+    AMNEZIA_INSTALLED=false
+    DOMAIN=""
+    LE_EMAIL=""
+    PANEL_PORT=5000
+    PANEL_DOMAIN=""
 
-    # Обновляем кэш apt один раз при старте, чтобы дальнейшие установки
-    # пакетов из любого пункта меню проходили без отдельного apt-get update.
-    apt-get update -y >> "$LOG_FILE" 2>&1
+    system_update
 
-    show_menu
+    install_nginx       # ШАГ 1
+    setup_website       # ШАГ 2
+    install_ssl         # ШАГ 3
+    install_amnezia_panel  # ШАГ 4
+    install_crowdsec    # ШАГ 5
+    enable_bbr          # ШАГ 6
+
+    check_panel_and_close_port  # Проверка HTTPS и закрытие порта 5000
+    install_myserverinfo        # Установка команды myserverinfo
+
+    print_summary
 }
 
 main "$@"
