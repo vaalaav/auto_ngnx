@@ -865,6 +865,7 @@ myserverinfo_install() {
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
+YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
@@ -886,6 +887,35 @@ header() {
     echo "  $1"
     echo "=================================================="
     echo ""
+}
+
+# Определяет, какой процесс реально слушает указанный TCP-порт (IPv4/IPv6).
+# Возвращает имя процесса (например "nginx", "xray"), "свободен" если порт
+# не прослушивается, либо "неизвестно" если не удалось определить процесс
+# (например, при запуске без прав root).
+port_owner() {
+    local port="$1"
+    local line proc
+
+    if ! command -v ss >/dev/null 2>&1; then
+        echo "н/д (нет команды ss)"
+        return
+    fi
+
+    # Ищем строку LISTEN, где локальный адрес заканчивается на ":<port>"
+    line=$(ss -tlnp 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {print; exit}')
+
+    if [ -z "$line" ]; then
+        echo "свободен"
+        return
+    fi
+
+    proc=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null)
+    if [ -z "$proc" ]; then
+        echo "неизвестно (нет прав root для определения процесса)"
+    else
+        echo "$proc"
+    fi
 }
 
 # --- Раздел: общая информация о системе ---
@@ -938,6 +968,39 @@ print_nginx() {
             echo -e "Status: ${RED}INACTIVE${NC}"
         fi
         echo "Version: $(nginx -v 2>&1 | sed 's#.*nginx/##')"
+
+        # Порты, заданные в конфигурации (директивы listen во всех
+        # подключенных конфигах, включая sites-enabled)
+        local cfg_ports
+        cfg_ports=$(nginx -T 2>/dev/null \
+            | grep -E '^\s*listen\s' \
+            | sed -E 's/^\s*listen\s+([^;]+);.*/\1/' \
+            | awk '{print $1}' \
+            | sed -E 's/^\[::\]://; s/^.*://' \
+            | sort -un | paste -sd ',' - | sed 's/,/, /g')
+        echo "Configured listen ports (nginx -T): ${cfg_ports:-н/д}"
+        echo ""
+
+        # Реальная проверка популярных портов веб-сервера: 80, 443, 8443.
+        # Это полезно в схемах, когда 443 занят другим сервисом
+        # (например, 3x-ui / xray с маскировкой под сайт), а сам сайт
+        # на nginx работает на альтернативном порту (например, 8443).
+        echo "Проверка портов (кто реально их слушает):"
+        local p owner
+        for p in 80 443 8443; do
+            owner=$(port_owner "$p")
+            case "$owner" in
+                свободен)
+                    echo -e "  Порт ${p}: ${YELLOW}свободен / не прослушивается${NC}"
+                    ;;
+                nginx)
+                    echo -e "  Порт ${p}: ${GREEN}nginx${NC}"
+                    ;;
+                *)
+                    echo -e "  Порт ${p}: ${YELLOW}${owner}${NC}"
+                    ;;
+            esac
+        done
     else
         echo -e "Installed: ${RED}NO${NC}"
     fi
@@ -989,8 +1052,13 @@ print_crowdsec() {
             echo -e "Status: ${RED}INACTIVE${NC}"
         fi
         echo "Version: $(cscli version 2>/dev/null | head -n1)"
-        echo "Collections:"
-        cscli collections list -o raw 2>/dev/null | tail -n +2 | awk -F',' '{print "  - "$1}'
+        echo ""
+        echo "Active decisions (аналог 'cscli decisions list'):"
+        if [ "$(id -u)" -eq 0 ]; then
+            cscli decisions list 2>&1
+        else
+            echo "Для просмотра активных решений запустите myserverinfo с правами root (sudo)"
+        fi
     else
         echo -e "Installed: ${RED}NO${NC}"
     fi
@@ -1189,12 +1257,12 @@ show_menu() {
         echo "  6) Включить BBR"
         echo "  7) Установить/обновить команду myserverinfo"
         echo "  8) Показать информацию о сервере"
-        echo "  9) Выход"
+        echo "  0) Выход"
         echo -e "${CYAN}===========================================================${NC}"
         echo ""
 
         local choice
-        read -rp "Выберите пункт меню [1-9]: " choice
+        read -rp "Выберите пункт меню [0-8]: " choice
 
         case "$choice" in
             1)
@@ -1232,12 +1300,12 @@ show_menu() {
                 echo ""
                 "$MYSERVERINFO_PATH"
                 ;;
-            9)
+            0)
                 msg_info "Завершение работы скрипта"
                 exit 0
                 ;;
             *)
-                msg_warn "Некорректный выбор '$choice'. Введите число от 1 до 9."
+                msg_warn "Некорректный выбор '$choice'. Введите число от 0 до 8."
                 ;;
         esac
     done
