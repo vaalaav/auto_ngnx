@@ -20,4 +20,5 @@
 9. BBR
    
 Установка:
+
 curl -fsSL https://raw.githubusercontent.com/vaalaav/auto_ngnx/main/setup-vps.sh -o setup-vps.sh && sudo bash setup-vps.sh
