@@ -61,6 +61,7 @@ SETUP_SCRIPT_PATH="/usr/local/bin/myserver-setup.sh"
 SITE_DOMAIN=""
 SITE_REPO=""
 CERTBOT_EMAIL=""
+SITE_HTTPS_PORT=""
 
 # Если конфиг уже существует (повторный запуск скрипта) - подгружаем значения,
 # чтобы не спрашивать у пользователя то, что он уже вводил ранее.
@@ -176,6 +177,7 @@ save_config() {
 SITE_DOMAIN="$SITE_DOMAIN"
 SITE_REPO="$SITE_REPO"
 CERTBOT_EMAIL="$CERTBOT_EMAIL"
+SITE_HTTPS_PORT="$SITE_HTTPS_PORT"
 EOF
 }
 
@@ -258,6 +260,113 @@ install_nginx() {
 ###############################################################################
 #                       2) УСТАНОВКА / ОБНОВЛЕНИЕ САЙТА
 ###############################################################################
+
+# Генерирует конфигурацию Nginx для сайта в $NGINX_CONF.
+#
+# Если для $SITE_DOMAIN уже существует сертификат Let's Encrypt
+# (/etc/letsencrypt/live/$SITE_DOMAIN/fullchain.pem), генерируется конфигурация
+# с двумя server-блоками:
+#   - порт 80: редирект на https (с указанием $SITE_HTTPS_PORT, если он не 443);
+#   - порт $SITE_HTTPS_PORT: HTTPS с сертификатом и самим сайтом.
+#
+# Если сертификата ещё нет, генерируется конфигурация только с HTTP на порту 80
+# (этого достаточно для прохождения ACME-проверки certbot).
+#
+# Вызывается как из install_site (первичная настройка/обновление сайта),
+# так и из install_ssl (после получения сертификата, чтобы добавить HTTPS-блок
+# и редирект на нужный порт).
+write_nginx_site_config() {
+    local cert_dir="/etc/letsencrypt/live/${SITE_DOMAIN}"
+    local https_port="${SITE_HTTPS_PORT:-443}"
+
+    if [ -f "${cert_dir}/fullchain.pem" ]; then
+        # --- Конфигурация с HTTPS ---
+
+        # Куда редиректить с HTTP. Если HTTPS работает на нестандартном порту
+        # (например, 8443, когда 443 занят другим сервисом вроде 3x-ui/Xray),
+        # порт указывается явно в адресе редиректа.
+        local redirect_target="https://\$host"
+        if [ "$https_port" != "443" ]; then
+            redirect_target="${redirect_target}:${https_port}"
+        fi
+
+        # Подключаем рекомендованные certbot параметры TLS, если они есть
+        # (создаются certbot'ом при первом получении сертификата).
+        local ssl_extra_lines=""
+        if [ -f /etc/letsencrypt/options-ssl-nginx.conf ]; then
+            ssl_extra_lines="    include /etc/letsencrypt/options-ssl-nginx.conf;"
+        else
+            ssl_extra_lines="    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;"
+        fi
+        if [ -f /etc/letsencrypt/ssl-dhparams.pem ]; then
+            ssl_extra_lines="${ssl_extra_lines}
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"
+        fi
+
+        cat > "$NGINX_CONF" << EOF
+# Конфигурация сгенерирована автоматически скриптом установки.
+
+# HTTP -> HTTPS редирект
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
+
+    location / {
+        return 301 ${redirect_target}\$request_uri;
+    }
+
+    access_log /var/log/nginx/${SITE_DOMAIN}_access.log;
+    error_log  /var/log/nginx/${SITE_DOMAIN}_error.log;
+}
+
+# HTTPS
+server {
+    listen ${https_port} ssl;
+    listen [::]:${https_port} ssl;
+
+    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
+
+    ssl_certificate     ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+${ssl_extra_lines}
+
+    root ${SITE_PATH};
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    access_log /var/log/nginx/${SITE_DOMAIN}_ssl_access.log;
+    error_log  /var/log/nginx/${SITE_DOMAIN}_ssl_error.log;
+}
+EOF
+    else
+        # --- Конфигурация только с HTTP (сертификата пока нет) ---
+        cat > "$NGINX_CONF" << EOF
+# Конфигурация сгенерирована автоматически скриптом установки.
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
+
+    root ${SITE_PATH};
+    index index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+    }
+
+    access_log /var/log/nginx/${SITE_DOMAIN}_access.log;
+    error_log  /var/log/nginx/${SITE_DOMAIN}_error.log;
+}
+EOF
+    fi
+}
 
 install_site() {
     msg_step "Настройка сайта"
@@ -390,26 +499,12 @@ EOF
     chown -R www-data:www-data "$SITE_PATH"
 
     # --- Создание конфигурации Nginx для сайта ---
+    # write_nginx_site_config сама определяет, нужен ли только HTTP (если
+    # сертификата для домена пока нет) или HTTP-редирект + HTTPS-блок (если
+    # сертификат уже существует - например, при повторном запуске после
+    # того, как был выполнен пункт "Установить/обновить SSL").
     msg_step "Создание конфигурации Nginx: $NGINX_CONF"
-    cat > "$NGINX_CONF" << EOF
-# Конфигурация сгенерирована автоматически скриптом установки.
-server {
-    listen 80;
-    listen [::]:80;
-
-    server_name ${SITE_DOMAIN} www.${SITE_DOMAIN};
-
-    root ${SITE_PATH};
-    index index.html index.htm;
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    access_log /var/log/nginx/${SITE_DOMAIN}_access.log;
-    error_log  /var/log/nginx/${SITE_DOMAIN}_error.log;
-}
-EOF
+    write_nginx_site_config
 
     # Создаём симлинк в sites-enabled (если уже существует - пересоздаём)
     ln -sf "$NGINX_CONF" "$NGINX_ENABLED"
@@ -467,6 +562,39 @@ install_ssl() {
         install_nginx || return 1
     fi
 
+    # --- Выбор порта, на котором будет работать HTTPS ---
+    # По умолчанию 443. Если порт 443 уже занят другим процессом (не nginx) -
+    # например, 3x-ui/Xray/Telegram-proxy - предлагаем альтернативный порт 8443.
+    local default_https_port="${SITE_HTTPS_PORT:-443}"
+    if [ -z "$SITE_HTTPS_PORT" ] && command -v ss >/dev/null 2>&1; then
+        local owner443
+        owner443=$(ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit}' \
+            | grep -oP 'users:\(\("\K[^"]+' 2>/dev/null)
+        if [ -n "$owner443" ] && [ "$owner443" != "nginx" ]; then
+            msg_warn "Порт 443 уже занят процессом '$owner443' (не nginx)."
+            default_https_port="8443"
+        fi
+    fi
+
+    local input_port
+    read -rp "На каком порту должен работать HTTPS для сайта? [${default_https_port}]: " input_port
+    SITE_HTTPS_PORT="${input_port:-$default_https_port}"
+
+    if ! [[ "$SITE_HTTPS_PORT" =~ ^[0-9]+$ ]] || [ "$SITE_HTTPS_PORT" -lt 1 ] || [ "$SITE_HTTPS_PORT" -gt 65535 ]; then
+        msg_err "Некорректный номер порта: $SITE_HTTPS_PORT"
+        return 1
+    fi
+    save_config
+
+    if [ "$SITE_HTTPS_PORT" != "443" ]; then
+        msg_info "HTTPS будет настроен на порту ${SITE_HTTPS_PORT} (порт 80 будет делать редирект на https://домен:${SITE_HTTPS_PORT})"
+        # Открываем нестандартный порт в ufw, если он активен
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw allow "${SITE_HTTPS_PORT}/tcp" >> "$LOG_FILE" 2>&1
+            msg_ok "Порт ${SITE_HTTPS_PORT}/tcp открыт в UFW"
+        fi
+    fi
+
     # Запрашиваем email для уведомлений Let's Encrypt (можно пропустить)
     local input_email
     read -rp "Email для уведомлений Let's Encrypt (Enter - без email) [${CERTBOT_EMAIL}]: " input_email
@@ -483,32 +611,69 @@ install_ssl() {
         email_args=(--register-unsafely-without-email --agree-tos)
     fi
 
-    # --- Получение / обновление сертификата ---
-    # Сначала пробуем получить сертификат для домена и www.домена
+    # --- Получение сертификата ---
+    # Используем "certbot certonly --nginx": nginx используется только для
+    # прохождения ACME-проверки (через временную вставку location в текущий
+    # конфиг), но сам конфиг nginx certbot не модифицирует - это позволяет
+    # нам самим управлять структурой конфига (включая нестандартный порт
+    # HTTPS) через write_nginx_site_config.
+    #
+    # --deploy-hook гарантирует, что nginx перезагрузится после получения
+    # или продления сертификата (чтобы подхватить новый сертификат).
+    #
+    # Сначала пробуем получить сертификат для домена и www.домена.
     msg_step "Получение сертификата для ${SITE_DOMAIN} и www.${SITE_DOMAIN}"
-    certbot --nginx \
+    certbot certonly --nginx \
         -d "$SITE_DOMAIN" -d "www.${SITE_DOMAIN}" \
         "${email_args[@]}" \
-        --redirect --non-interactive >> "$LOG_FILE" 2>&1
+        --deploy-hook "systemctl reload nginx" \
+        --non-interactive >> "$LOG_FILE" 2>&1
     local result=$?
 
     if [ $result -ne 0 ]; then
         # Возможно, www.домен не существует в DNS - пробуем без www
         msg_warn "Не удалось получить сертификат для www.${SITE_DOMAIN}, пробую только для ${SITE_DOMAIN}"
-        certbot --nginx \
+        certbot certonly --nginx \
             -d "$SITE_DOMAIN" \
             "${email_args[@]}" \
-            --redirect --non-interactive >> "$LOG_FILE" 2>&1
+            --deploy-hook "systemctl reload nginx" \
+            --non-interactive >> "$LOG_FILE" 2>&1
         result=$?
     fi
 
     if [ $result -ne 0 ]; then
         msg_err "Не удалось получить SSL-сертификат для ${SITE_DOMAIN}."
-        msg_err "Проверьте, что DNS-запись домена указывает на этот сервер, и см. $LOG_FILE"
+        msg_err "Проверьте, что DNS-запись домена указывает на этот сервер"
+        show_log_tail
         return 1
     fi
 
-    msg_ok "SSL-сертификат для ${SITE_DOMAIN} получен и подключён к Nginx"
+    msg_ok "SSL-сертификат для ${SITE_DOMAIN} получен"
+
+    # --- Пересобираем конфигурацию Nginx с учётом полученного сертификата
+    # и выбранного порта HTTPS (HTTP-блок теперь будет редиректить на HTTPS) ---
+    msg_step "Обновление конфигурации Nginx (HTTPS на порту ${SITE_HTTPS_PORT})"
+    write_nginx_site_config
+
+    nginx -t >> "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        msg_err "Конфигурация Nginx содержит ошибки после настройки SSL"
+        show_log_tail
+        return 1
+    fi
+    msg_ok "Конфигурация Nginx корректна"
+
+    systemctl reload nginx >> "$LOG_FILE" 2>&1
+    if [ $? -ne 0 ]; then
+        msg_err "Не удалось перезагрузить Nginx"
+        return 1
+    fi
+
+    if [ "$SITE_HTTPS_PORT" = "443" ]; then
+        msg_ok "Сайт ${SITE_DOMAIN} доступен по https://${SITE_DOMAIN} (http перенаправляется на https)"
+    else
+        msg_ok "Сайт ${SITE_DOMAIN} доступен по https://${SITE_DOMAIN}:${SITE_HTTPS_PORT} (http перенаправляется на этот адрес)"
+    fi
 
     # --- Проверка таймера автоматического продления сертификатов ---
     msg_step "Проверка таймера автопродления certbot.timer"
@@ -1004,8 +1169,9 @@ if [ "$(id -u)" -eq 0 ]; then
     IS_ROOT=1
 fi
 
-# Подгружаем сохранённые значения (домен сайта и т.п.)
+# Подгружаем сохранённые значения (домен сайта, порт HTTPS и т.п.)
 SITE_DOMAIN=""
+SITE_HTTPS_PORT=""
 if [ -f "$CONFIG_FILE" ]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
@@ -1146,13 +1312,21 @@ print_nginx() {
         echo "Configured listen ports (nginx -T): ${cfg_ports:-н/д}"
         echo ""
 
-        # Реальная проверка популярных портов веб-сервера: 80, 443, 8443.
-        # Это полезно в схемах, когда 443 занят другим сервисом
-        # (например, 3x-ui / xray с маскировкой под сайт), а сам сайт
-        # на nginx работает на альтернативном порту (например, 8443).
+        # Реальная проверка популярных портов веб-сервера: 80, 443, 8443,
+        # а также порт HTTPS, заданный для сайта (SITE_HTTPS_PORT), если он
+        # отличается от уже перечисленных. Это полезно в схемах, когда 443
+        # занят другим сервисом (например, 3x-ui / xray с маскировкой под
+        # сайт), а сам сайт на nginx работает на альтернативном порту
+        # (например, 8443).
         echo "Проверка портов (кто реально их слушает):"
-        local p owner
-        for p in 80 443 8443; do
+        local p owner ports_to_check="80 443 8443"
+        if [ -n "$SITE_HTTPS_PORT" ]; then
+            case " $ports_to_check " in
+                *" $SITE_HTTPS_PORT "*) ;;
+                *) ports_to_check="$ports_to_check $SITE_HTTPS_PORT" ;;
+            esac
+        fi
+        for p in $ports_to_check; do
             owner=$(port_owner "$p")
             case "$owner" in
                 свободен)
