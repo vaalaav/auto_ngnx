@@ -153,7 +153,7 @@ BBR: Включен
 | SSL | Let's Encrypt + Certbot |
 | CrowdSec | Защита от атак |
 | Firewall Bouncer | Интеграция CrowdSec с firewall |
-| CyberOK | Списки доверенных IP |
+| CyberOK | Блокировка IP сканеров |
 | TCP BBR | Современный алгоритм TCP |
 | myserverinfo | Мониторинг сервера |
 
